@@ -70,13 +70,33 @@ go build -o webadmin ./cmd/webadmin
 
 # Build HA Agent (deployed to MySQL nodes via web UI)
 GOOS=linux GOARCH=amd64 go build -o mypatroni ./cmd/mypatroni
+
+# Build frontend (optional, for development)
+cd web/frontend
+npm install
+npm run build  # Output to web/dist, served by webadmin
 ```
 
-#### Run Web Admin
+#### Run
+
+**Option 1: Production Mode (Recommended)**
 
 ```bash
+# Start webadmin (serves built frontend from web/dist)
 ./webadmin
-# Server starts on http://localhost:8888
+# Access http://localhost:8888
+```
+
+**Option 2: Development Mode (Hot Reload)**
+
+```bash
+# Terminal 1: Start backend
+./webadmin
+
+# Terminal 2: Start frontend dev server
+cd web/frontend
+npm run dev
+# Access http://localhost:3000 (proxies API to :8888)
 ```
 
 #### Deploy a Cluster
@@ -232,13 +252,33 @@ go build -o webadmin ./cmd/webadmin
 
 # 编译 HA Agent（通过 Web UI 部署到 MySQL 节点）
 GOOS=linux GOARCH=amd64 go build -o mypatroni ./cmd/mypatroni
+
+# 编译前端（可选，用于开发）
+cd web/frontend
+npm install
+npm run build  # 输出到 web/dist，由 webadmin 提供服务
 ```
 
-#### 运行 Web 管理端
+#### 运行
+
+**方式一：生产模式（推荐）**
 
 ```bash
+# 启动 webadmin（从 web/dist 提供已构建的前端）
 ./webadmin
-# 服务启动在 http://localhost:8888
+# 访问 http://localhost:8888
+```
+
+**方式二：开发模式（热重载）**
+
+```bash
+# 终端 1：启动后端
+./webadmin
+
+# 终端 2：启动前端开发服务器
+cd web/frontend
+npm run dev
+# 访问 http://localhost:3000（API 代理到 :8888）
 ```
 
 #### 部署集群

@@ -3,16 +3,19 @@ package api
 import "fmt"
 
 // SwitchoverRequest represents a switchover API request
+// For HA Agent: target_node_id is optional (current node becomes leader)
+// For webadmin: target_node_id specifies which node should become leader
 type SwitchoverRequest struct {
-	TargetNodeID string `json:"target_node_id"`
+	TargetNodeID string `json:"target_node_id,omitempty"`
 	Reason       string `json:"reason,omitempty"`
 }
 
 // Validate validates the switchover request
+// Note: target_node_id is NOT required for HA Agent API
+// The HA Agent will make the current node become the leader
 func (r *SwitchoverRequest) Validate() error {
-	if r.TargetNodeID == "" {
-		return fmt.Errorf("target_node_id is required")
-	}
+	// No required fields for HA Agent switchover
+	// Reason is optional
 	return nil
 }
 

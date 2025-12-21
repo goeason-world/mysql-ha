@@ -12,7 +12,7 @@
         "password": "wuhua@2013",
         "roles": [
           "etcd",
-          "master"
+          "slave"
         ],
         "status": "completed"
       },
@@ -38,7 +38,7 @@
         "password": "wuhua@2013",
         "roles": [
           "etcd",
-          "slave"
+          "master"
         ],
         "status": "completed"
       }

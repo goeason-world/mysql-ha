@@ -842,12 +842,10 @@ func (a *Agent) RequestSwitchover(reason string) error {
 	}
 
 	// 尝试获取 etcd 锁
-	// 首先强制释放当前锁（如果有的话），然后获取新锁
-	// 这是手动切换，所以我们需要强制获取锁
 	a.logger.Info("attempting to acquire leadership lock for switchover")
 
-	// 尝试多次获取锁
-	maxRetries := 10
+	// 尝试多次获取锁（等待当前 leader 释放）
+	maxRetries := 30 // 增加重试次数，等待 demote 完成
 	var lastErr error
 	for i := range maxRetries {
 		acquired, err := a.lockManager.TryAcquire(ctx)
@@ -882,6 +880,43 @@ func (a *Agent) RequestSwitchover(reason string) error {
 		return fmt.Errorf("failed to acquire leadership lock after %d attempts: %w", maxRetries, lastErr)
 	}
 	return fmt.Errorf("failed to acquire leadership lock after %d attempts: lock held by another node", maxRetries)
+}
+
+// RequestDemote requests this node to release the leader lock
+// This is called via the API when a manual switchover is requested on another node
+func (a *Agent) RequestDemote(reason string) error {
+	a.logger.Info(fmt.Sprintf("demote requested: %s", reason))
+
+	// 检查是否是 leader
+	if !a.lockManager.IsLeader() {
+		a.logger.Info("not the leader, no demote needed")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 停止锁续约
+	a.lockManager.StopRenewal()
+
+	// 设置 MySQL 为只读
+	if err := a.mysql.SetReadOnly(true); err != nil {
+		a.logger.Warn(fmt.Sprintf("failed to set read-only: %v", err))
+	}
+
+	// 释放锁
+	if err := a.lockManager.Release(ctx); err != nil {
+		a.logger.Error(fmt.Sprintf("failed to release lock: %v", err))
+		return fmt.Errorf("failed to release lock: %w", err)
+	}
+
+	// 更新状态
+	a.mu.Lock()
+	a.state.Role = RoleReplica
+	a.mu.Unlock()
+
+	a.logger.Info(fmt.Sprintf("demote completed, released leadership (reason: %s)", reason))
+	return nil
 }
 
 // repairMySQLEnvironment checks and repairs MySQL runtime environment

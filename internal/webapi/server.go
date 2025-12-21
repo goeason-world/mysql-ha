@@ -931,12 +931,15 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 查找目标节点
+	// 查找目标节点和当前 leader
 	var targetHost *installer.Host
+	var currentLeaderHost *installer.Host
 	for i := range cluster.Hosts {
 		if cluster.Hosts[i].ID == req.TargetNodeID {
 			targetHost = &cluster.Hosts[i]
-			break
+		}
+		if cluster.Hosts[i].HasRole(installer.RoleMaster) {
+			currentLeaderHost = &cluster.Hosts[i]
 		}
 	}
 
@@ -945,15 +948,39 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 在后台执行切换 - 通过调用目标节点的 HA Agent API
+	// 在后台执行切换
 	go func() {
 		log.Printf("[INFO] Starting switchover to node %s (%s), reason: %s", targetHost.Name, targetHost.IP, req.Reason)
 
-		// 调用目标节点的 HA Agent /api/v1/switchover API
+		client := &http.Client{Timeout: 60 * time.Second}
+
+		// Step 1: 先通知当前 leader 释放锁（如果有的话）
+		if currentLeaderHost != nil && currentLeaderHost.ID != req.TargetNodeID {
+			log.Printf("[INFO] Step 1: Requesting current leader %s (%s) to demote", currentLeaderHost.Name, currentLeaderHost.IP)
+			demoteURL := fmt.Sprintf("http://%s:%d/api/v1/demote", currentLeaderHost.IP, cluster.Settings.HAAgentPort)
+			demoteBody := fmt.Sprintf(`{"reason":"switchover to %s"}`, targetHost.Name)
+
+			resp, err := client.Post(demoteURL, "application/json", strings.NewReader(demoteBody))
+			if err != nil {
+				log.Printf("[WARN] Failed to call demote API on current leader: %v, continuing anyway", err)
+			} else {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK {
+					log.Printf("[INFO] Current leader demoted successfully")
+				} else {
+					log.Printf("[WARN] Demote returned status %d, continuing anyway", resp.StatusCode)
+				}
+			}
+
+			// 等待锁释放
+			time.Sleep(2 * time.Second)
+		}
+
+		// Step 2: 调用目标节点的 HA Agent /api/v1/switchover API
+		log.Printf("[INFO] Step 2: Requesting target node %s (%s) to become leader", targetHost.Name, targetHost.IP)
 		agentURL := fmt.Sprintf("http://%s:%d/api/v1/switchover", targetHost.IP, cluster.Settings.HAAgentPort)
 		reqBody := fmt.Sprintf(`{"reason":"%s"}`, req.Reason)
 
-		client := &http.Client{Timeout: 60 * time.Second}
 		resp, err := client.Post(agentURL, "application/json", strings.NewReader(reqBody))
 		if err != nil {
 			log.Printf("[ERROR] Switchover failed: failed to call HA Agent API: %v", err)
