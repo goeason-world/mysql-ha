@@ -26,6 +26,7 @@ type Server struct {
 type AgentInterface interface {
 	GetState() interface{}
 	IsLeader() bool
+	RequestSwitchover(reason string) error // 请求成为 leader
 }
 
 // AgentWrapper wraps an agent to implement AgentInterface
@@ -193,10 +194,15 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Execute switchover
+	// 执行 switchover - 请求当前节点成为 leader
+	if err := s.agent.RequestSwitchover(req.Reason); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("switchover failed: %v", err))
+		return
+	}
+
 	s.writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":  "accepted",
-		"message": "switchover initiated",
+		"message": "switchover initiated, this node is now the leader",
 	})
 }
 

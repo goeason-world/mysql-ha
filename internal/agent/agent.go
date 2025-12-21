@@ -814,6 +814,76 @@ func (a *Agent) updateState(ctx context.Context) {
 	}
 }
 
+// RequestSwitchover requests this node to become the leader
+// This is called via the API when a manual switchover is requested
+func (a *Agent) RequestSwitchover(reason string) error {
+	a.logger.Info(fmt.Sprintf("switchover requested: %s", reason))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 检查 MySQL 是否健康
+	if err := a.mysql.Ping(); err != nil {
+		return fmt.Errorf("MySQL is not healthy: %w", err)
+	}
+
+	// 检查是否已经是 leader
+	if a.lockManager.IsLeader() {
+		a.logger.Info("already the leader, no switchover needed")
+		return nil
+	}
+
+	// 获取当前 leader 信息
+	_, currentLeaderHost, _, err := a.getLeaderInfo(ctx)
+	if err != nil {
+		a.logger.Warn(fmt.Sprintf("failed to get current leader info: %v", err))
+	} else {
+		a.logger.Info(fmt.Sprintf("current leader is %s, requesting switchover", currentLeaderHost))
+	}
+
+	// 尝试获取 etcd 锁
+	// 首先强制释放当前锁（如果有的话），然后获取新锁
+	// 这是手动切换，所以我们需要强制获取锁
+	a.logger.Info("attempting to acquire leadership lock for switchover")
+
+	// 尝试多次获取锁
+	maxRetries := 10
+	var lastErr error
+	for i := range maxRetries {
+		acquired, err := a.lockManager.TryAcquire(ctx)
+		if err != nil {
+			lastErr = err
+			a.logger.Warn(fmt.Sprintf("failed to acquire lock (attempt %d/%d): %v", i+1, maxRetries, err))
+			time.Sleep(time.Second)
+			continue
+		}
+
+		if acquired {
+			a.logger.Info("successfully acquired leadership lock")
+			// 执行提升
+			if err := a.Promote(); err != nil {
+				a.logger.Error(fmt.Sprintf("failed to promote: %v, releasing lock", err))
+				a.lockManager.Release(ctx)
+				return fmt.Errorf("failed to promote to leader: %w", err)
+			}
+
+			// 启动锁续约
+			a.lockManager.StartRenewal(ctx)
+			a.logger.Info(fmt.Sprintf("switchover completed successfully, I am now the leader (reason: %s)", reason))
+			return nil
+		}
+
+		// 锁被其他节点持有，等待一下再试
+		a.logger.Debug(fmt.Sprintf("lock held by another node, waiting... (attempt %d/%d)", i+1, maxRetries))
+		time.Sleep(time.Second)
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("failed to acquire leadership lock after %d attempts: %w", maxRetries, lastErr)
+	}
+	return fmt.Errorf("failed to acquire leadership lock after %d attempts: lock held by another node", maxRetries)
+}
+
 // repairMySQLEnvironment checks and repairs MySQL runtime environment
 // This handles issues like missing directories after system reboot
 func (a *Agent) repairMySQLEnvironment() error {

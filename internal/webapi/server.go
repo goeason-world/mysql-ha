@@ -945,16 +945,36 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 在后台执行切换
+	// 在后台执行切换 - 通过调用目标节点的 HA Agent API
 	go func() {
 		log.Printf("[INFO] Starting switchover to node %s (%s), reason: %s", targetHost.Name, targetHost.IP, req.Reason)
 
-		if err := s.installer.PerformSwitchover(cluster, req.TargetNodeID); err != nil {
-			log.Printf("[ERROR] Switchover failed: %v", err)
+		// 调用目标节点的 HA Agent /api/v1/switchover API
+		agentURL := fmt.Sprintf("http://%s:%d/api/v1/switchover", targetHost.IP, cluster.Settings.HAAgentPort)
+		reqBody := fmt.Sprintf(`{"reason":"%s"}`, req.Reason)
+
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Post(agentURL, "application/json", strings.NewReader(reqBody))
+		if err != nil {
+			log.Printf("[ERROR] Switchover failed: failed to call HA Agent API: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+			// 读取错误信息
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			json.NewDecoder(resp.Body).Decode(&errResp)
+			log.Printf("[ERROR] Switchover failed: HA Agent returned status %d: %s", resp.StatusCode, errResp.Error)
 			return
 		}
 
-		// 更新集群配置中的角色
+		// 等待一段时间让 etcd 更新 leader_info
+		time.Sleep(3 * time.Second)
+
+		// 更新集群配置中的角色（基于 etcd 中的实际状态）
 		s.mu.Lock()
 		for i := range cluster.Hosts {
 			if cluster.Hosts[i].IsMySQLNode() {
@@ -986,7 +1006,7 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"status":  "accepted",
-		"message": "switchover initiated",
+		"message": "switchover initiated via HA Agent",
 	})
 }
 
