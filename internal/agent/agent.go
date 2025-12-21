@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -49,6 +50,12 @@ func NewAgent(cfg *config.Config, d dcs.DCS, mysqlMgr *mysql.Manager, logger *lo
 // Start starts the agent
 func (a *Agent) Start(ctx context.Context) error {
 	a.logger.Info("starting HA agent")
+
+	// 启动时先检查和修复 MySQL 环境
+	a.logger.Info("performing initial MySQL environment check...")
+	if err := a.repairMySQLEnvironment(); err != nil {
+		a.logger.Warn(fmt.Sprintf("initial MySQL environment repair failed: %v, will retry during connection", err))
+	}
 
 	// Connect to DCS with retry
 	if err := a.connectDCSWithRetry(ctx); err != nil {
@@ -123,6 +130,15 @@ func (a *Agent) connectMySQLWithRetry(ctx context.Context) {
 		default:
 		}
 
+		// 在尝试连接 MySQL 前，先确保 MySQL 环境正常
+		if attempt > 0 && attempt%3 == 0 {
+			// 每 3 次连接失败后，尝试修复 MySQL 环境
+			a.logger.Info("attempting to repair MySQL environment before retry")
+			if err := a.repairMySQLEnvironment(); err != nil {
+				a.logger.Warn(fmt.Sprintf("failed to repair MySQL environment: %v", err))
+			}
+		}
+
 		if err := a.mysql.Connect(); err != nil {
 			attempt++
 			delay := min(baseDelay*time.Duration(1<<uint(min(attempt, 5))), maxDelay)
@@ -195,8 +211,10 @@ func (a *Agent) IsLeader() bool {
 // getMyHost returns this node's advertise host
 func (a *Agent) getMyHost() string {
 	if a.config.AdvertiseHost != "" {
+		a.logger.Debug(fmt.Sprintf("getMyHost: using AdvertiseHost=%s", a.config.AdvertiseHost))
 		return a.config.AdvertiseHost
 	}
+	a.logger.Debug(fmt.Sprintf("getMyHost: AdvertiseHost is empty, falling back to MySQL.Host=%s", a.config.MySQL.Host))
 	return a.config.MySQL.Host
 }
 
@@ -256,14 +274,16 @@ func (a *Agent) storeLeaderInfo(ctx context.Context) error {
 	host := a.getMyHost()
 	leaderInfo := fmt.Sprintf(`{"node_id":"%s","host":"%s","port":%d,"timestamp":%d}`,
 		a.config.Name, host, a.config.MySQL.Port, time.Now().Unix())
-	key := fmt.Sprintf("%s/leader_info", a.config.Scope)
-	a.logger.Info(fmt.Sprintf("storing leader info in etcd: key=%s, host=%s", key, host))
+	// 使用 "leader_info" 作为 key，DCS 会自动加上 prefix
+	key := "leader_info"
+	a.logger.Info(fmt.Sprintf("storing leader info in etcd: key=%s, host=%s, value=%s", key, host, leaderInfo))
 	return a.dcs.Set(ctx, key, []byte(leaderInfo))
 }
 
 // getLeaderInfo retrieves the current leader's connection info from etcd
 func (a *Agent) getLeaderInfo(ctx context.Context) (string, string, int, error) {
-	key := fmt.Sprintf("%s/leader_info", a.config.Scope)
+	// 使用 "leader_info" 作为 key，DCS 会自动加上 prefix
+	key := "leader_info"
 	data, err := a.dcs.Get(ctx, key)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("failed to get leader info from etcd: %w", err)
@@ -529,11 +549,14 @@ func (a *Agent) handleAsLeader(ctx context.Context, leaderHost, myHost string) {
 		return
 	}
 
-	// 确保 etcd 中的 leader_info 指向我
+	// 确保 etcd 中的 leader_info 指向我（无论当前值是什么）
+	// 这是关键：即使 leaderHost 为空或指向其他节点，都要更新
 	if leaderHost != myHost {
-		a.logger.Info(fmt.Sprintf("leader_info points to %s but I hold the lock, updating leader_info", leaderHost))
+		a.logger.Info(fmt.Sprintf("leader_info points to '%s' but I hold the lock (my host: %s), updating leader_info", leaderHost, myHost))
 		if err := a.storeLeaderInfo(ctx); err != nil {
 			a.logger.Error(fmt.Sprintf("failed to update leader info: %v", err))
+		} else {
+			a.logger.Info(fmt.Sprintf("successfully updated leader_info to point to me: %s", myHost))
 		}
 	}
 
@@ -789,4 +812,82 @@ func (a *Agent) updateState(ctx context.Context) {
 		a.state.ReplicationLag = lag
 		a.mu.Unlock()
 	}
+}
+
+// repairMySQLEnvironment checks and repairs MySQL runtime environment
+// This handles issues like missing directories after system reboot
+func (a *Agent) repairMySQLEnvironment() error {
+	a.logger.Info("checking MySQL environment...")
+
+	// 需要检查和修复的目录
+	dirs := []struct {
+		path  string
+		owner string
+		mode  os.FileMode
+	}{
+		{"/var/run/mysqld", "mysql", 0755},
+		{"/var/log/mysql", "mysql", 0755},
+	}
+
+	// 从配置中获取数据目录（如果有的话）
+	// 默认数据目录
+	dataDir := "/var/lib/mysql"
+	dirs = append(dirs, struct {
+		path  string
+		owner string
+		mode  os.FileMode
+	}{dataDir, "mysql", 0750})
+
+	for _, dir := range dirs {
+		// 检查目录是否存在
+		if _, err := os.Stat(dir.path); os.IsNotExist(err) {
+			a.logger.Info(fmt.Sprintf("creating missing directory: %s", dir.path))
+			// 使用 sudo 创建目录
+			cmd := exec.Command("sudo", "mkdir", "-p", dir.path)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				a.logger.Warn(fmt.Sprintf("failed to create directory %s: %v, output: %s", dir.path, err, string(output)))
+				continue
+			}
+		}
+
+		// 设置目录权限
+		cmd := exec.Command("sudo", "chown", fmt.Sprintf("%s:%s", dir.owner, dir.owner), dir.path)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			a.logger.Warn(fmt.Sprintf("failed to chown %s: %v, output: %s", dir.path, err, string(output)))
+		}
+
+		cmd = exec.Command("sudo", "chmod", fmt.Sprintf("%o", dir.mode), dir.path)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			a.logger.Warn(fmt.Sprintf("failed to chmod %s: %v, output: %s", dir.path, err, string(output)))
+		}
+	}
+
+	// 检查 MySQL 服务状态
+	cmd := exec.Command("systemctl", "is-active", "mysqld")
+	output, err := cmd.CombinedOutput()
+	mysqlActive := err == nil && string(output) == "active\n"
+
+	if !mysqlActive {
+		a.logger.Info("MySQL service is not active, attempting to start...")
+
+		// 先尝试重启 MySQL 服务
+		cmd = exec.Command("sudo", "systemctl", "restart", "mysqld")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			a.logger.Warn(fmt.Sprintf("failed to restart mysqld: %v, output: %s", err, string(output)))
+
+			// 如果 mysqld 服务不存在，尝试 mysql 服务
+			cmd = exec.Command("sudo", "systemctl", "restart", "mysql")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				a.logger.Warn(fmt.Sprintf("failed to restart mysql: %v, output: %s", err, string(output)))
+				return fmt.Errorf("failed to start MySQL service")
+			}
+		}
+
+		// 等待 MySQL 启动
+		a.logger.Info("waiting for MySQL to start...")
+		time.Sleep(5 * time.Second)
+	}
+
+	a.logger.Info("MySQL environment check completed")
+	return nil
 }

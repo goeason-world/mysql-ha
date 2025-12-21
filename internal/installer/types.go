@@ -82,6 +82,16 @@ func (h *Host) IsEtcdNode() bool {
 	return h.HasRole(RoleEtcd)
 }
 
+// IsMasterNode checks if host has master role
+func (h *Host) IsMasterNode() bool {
+	return h.HasRole(RoleMaster)
+}
+
+// IsSlaveNode checks if host has slave role
+func (h *Host) IsSlaveNode() bool {
+	return h.HasRole(RoleSlave)
+}
+
 // ClusterConfig represents the cluster configuration
 type ClusterConfig struct {
 	ID           string           `json:"id"`

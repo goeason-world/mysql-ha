@@ -57,6 +57,10 @@ func main() {
 	}
 	defer logger.Sync()
 
+	// 打印关键配置信息用于调试
+	logger.Info(fmt.Sprintf("Config loaded: name=%s, scope=%s, advertise_host=%s, mysql_host=%s",
+		cfg.Name, cfg.Scope, cfg.AdvertiseHost, cfg.MySQL.Host))
+
 	// Initialize DCS
 	etcdDCS := dcs.NewEtcdDCS(dcs.EtcdConfig{
 		Endpoints: cfg.DCS.Endpoints,

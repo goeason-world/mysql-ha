@@ -511,6 +511,8 @@ After=network.target
 Type=simple
 User=mysql
 Group=mysql
+# 确保必要的目录存在且权限正确
+ExecStartPre=/bin/bash -c 'mkdir -p /var/run/mysqld /var/log/mysql %s && chown mysql:mysql /var/run/mysqld /var/log/mysql %s && chmod 755 /var/run/mysqld /var/log/mysql && chmod 750 %s'
 ExecStart=%s/mysql/bin/mysqld --defaults-file=/etc/my.cnf --user=mysql
 ExecStop=/bin/kill -SIGTERM $MAINPID
 TimeoutStartSec=300
@@ -521,7 +523,7 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`, installPath)
+`, dataPath, dataPath, dataPath, installPath)
 }
 
 func generateAgentConfig(host *Host, config *ClusterConfig) string {

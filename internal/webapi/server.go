@@ -694,6 +694,56 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	var nodes []NodeStatus
 	var leaderNode *NodeStatus
 
+	// Step 1: 从 etcd 获取真正的 leader 信息
+	var etcdLeaderHost string
+	var etcdLeaderNodeID string
+	var etcdLeaderInfo string
+
+	// 找到一个 etcd 节点来查询
+	for _, host := range cluster.Hosts {
+		if host.IsEtcdNode() {
+			sshClient, err := installer.NewSSHClient(&host)
+			if err != nil {
+				log.Printf("[WARN] 无法连接 etcd 节点 %s: %v", host.Name, err)
+				continue
+			}
+
+			// 查询 etcd 中的 leader_info
+			// Agent 使用的 prefix 是 /mypatroni/{cluster_name}，key 是 leader_info
+			// 完整路径是 /mypatroni/{cluster_name}/leader_info
+			key := fmt.Sprintf("/mypatroni/%s/leader_info", cluster.Name)
+			etcdCmd := fmt.Sprintf("etcdctl get '%s' --print-value-only 2>/dev/null || /usr/local/bin/etcdctl get '%s' --print-value-only 2>/dev/null", key, key)
+			output, err := sshClient.Run(etcdCmd)
+			sshClient.Close()
+
+			if err == nil && strings.TrimSpace(output) != "" {
+				etcdLeaderInfo = strings.TrimSpace(output)
+				log.Printf("[INFO] 从 etcd 获取 leader_info: key=%s, value=%s", key, etcdLeaderInfo)
+
+				// 解析 leader_info JSON: {"node_id":"xxx","host":"10.211.55.32","port":3306,"timestamp":xxx}
+				// 简单解析 host 字段
+				if hostStart := strings.Index(etcdLeaderInfo, `"host":"`); hostStart > 0 {
+					hostStart += 8
+					if hostEnd := strings.Index(etcdLeaderInfo[hostStart:], `"`); hostEnd > 0 {
+						etcdLeaderHost = etcdLeaderInfo[hostStart : hostStart+hostEnd]
+					}
+				}
+				// 解析 node_id 字段
+				if nodeIDStart := strings.Index(etcdLeaderInfo, `"node_id":"`); nodeIDStart > 0 {
+					nodeIDStart += 11
+					if nodeIDEnd := strings.Index(etcdLeaderInfo[nodeIDStart:], `"`); nodeIDEnd > 0 {
+						etcdLeaderNodeID = etcdLeaderInfo[nodeIDStart : nodeIDStart+nodeIDEnd]
+					}
+				}
+				log.Printf("[INFO] 解析 etcd leader: node_id=%s, host=%s", etcdLeaderNodeID, etcdLeaderHost)
+				break
+			} else {
+				log.Printf("[WARN] etcd 中没有 leader_info 或查询失败: key=%s, err=%v, output=%s", key, err, output)
+			}
+		}
+	}
+
+	// Step 2: 收集各节点状态
 	for _, host := range cluster.Hosts {
 		if !host.IsMySQLNode() {
 			continue
@@ -711,27 +761,31 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		client := &http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Get(agentURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
+			// Agent 端口可达，Agent 是健康的
 			node.AgentHealthy = true
 			// 解析 agent 返回的状态
 			var agentState struct {
 				NodeID       string `json:"node_id"`
 				Role         string `json:"role"`
-				IsHealthy    bool   `json:"is_healthy"`
+				IsHealthy    bool   `json:"is_healthy"` // 这是 MySQL 的健康状态
 				GTIDExecuted string `json:"gtid_executed"`
 			}
 			if json.NewDecoder(resp.Body).Decode(&agentState) == nil {
+				// IsHealthy 是 Agent 报告的 MySQL 健康状态
 				node.MySQLHealthy = agentState.IsHealthy
-				// 使用 agent 报告的角色（更准确）
+				// 使用 agent 报告的角色
 				if agentState.Role == "leader" {
 					node.Role = "leader"
 				} else if agentState.Role == "replica" {
 					node.Role = "replica"
 				}
+				log.Printf("[DEBUG] Agent %s 报告: role=%s, mysql_healthy=%v", host.Name, agentState.Role, agentState.IsHealthy)
 			}
 			resp.Body.Close()
 		} else {
-			// Agent 不可用，尝试直接检查 MySQL
+			// Agent 不可用（端口不通或返回错误）
 			node.AgentHealthy = false
+			log.Printf("[DEBUG] Agent %s 不可达: %v", host.Name, err)
 			// 通过 SSH 检查 MySQL 进程
 			sshClient, err := installer.NewSSHClient(&host)
 			if err == nil {
@@ -743,43 +797,70 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 综合健康状态：MySQL 和 Agent 都健康才算健康
-		node.IsHealthy = node.MySQLHealthy && node.AgentHealthy
+		// 综合健康状态：Agent 健康即可显示为在线
+		node.IsHealthy = node.AgentHealthy
 
-		// 如果 agent 没有报告角色，使用配置中的角色
+		// 角色判断优先级：agent 报告 > etcd leader_info > 配置文件
+		// 如果 agent 已经报告了角色，保持不变（agent 持有锁才会报告 leader）
 		if node.Role == "" {
-			if host.HasRole(installer.RoleMaster) {
+			// agent 没有报告角色，检查 etcd
+			if etcdLeaderHost != "" && host.IP == etcdLeaderHost {
 				node.Role = "leader"
-			} else {
+				log.Printf("[INFO] 根据 etcd leader_info，%s (%s) 是 leader（但 agent 未确认）", host.Name, host.IP)
+			} else if etcdLeaderHost != "" {
 				node.Role = "replica"
+			} else {
+				// etcd 也没有信息，使用配置
+				if host.HasRole(installer.RoleMaster) {
+					node.Role = "leader"
+					log.Printf("[WARN] etcd 无 leader_info，根据配置 %s 是 master 角色", host.Name)
+				} else {
+					node.Role = "replica"
+				}
 			}
 		}
 
 		nodes = append(nodes, node)
 	}
 
-	// 选择真正的 leader：优先选择健康的 leader，如果没有健康的 leader，选择任意一个 leader
+	// Step 3: 确定最终的 leader 节点
+	// 优先使用 agent 报告的角色（agent 持有 etcd 锁才会报告自己是 leader）
 	for i := range nodes {
-		if nodes[i].Role == "leader" && nodes[i].IsHealthy {
+		if nodes[i].Role == "leader" && nodes[i].AgentHealthy {
 			leaderNode = &nodes[i]
+			log.Printf("[INFO] 最终 leader (来自 agent 报告): %s (%s)", nodes[i].Name, nodes[i].IP)
 			break
 		}
 	}
-	// 如果没有健康的 leader，选择第一个 leader（即使不健康）
+
+	// 如果没有 agent 报告为 leader，使用 etcd 中的 leader_info（可能是旧数据）
+	if leaderNode == nil && etcdLeaderHost != "" {
+		for i := range nodes {
+			if nodes[i].IP == etcdLeaderHost {
+				leaderNode = &nodes[i]
+				log.Printf("[WARN] 最终 leader (来自 etcd，可能是旧数据): %s (%s)", nodes[i].Name, nodes[i].IP)
+				break
+			}
+		}
+	}
+
+	// 最后备选：选择第一个 leader 角色的节点
 	if leaderNode == nil {
 		for i := range nodes {
 			if nodes[i].Role == "leader" {
 				leaderNode = &nodes[i]
+				log.Printf("[WARN] 最终 leader (后备选择): %s (%s)", nodes[i].Name, nodes[i].IP)
 				break
 			}
 		}
 	}
 
 	response := map[string]interface{}{
-		"cluster_id":   id,
-		"cluster_name": cluster.Name,
-		"leader":       leaderNode,
-		"nodes":        nodes,
+		"cluster_id":       id,
+		"cluster_name":     cluster.Name,
+		"leader":           leaderNode,
+		"nodes":            nodes,
+		"etcd_leader_info": etcdLeaderInfo, // 返回原始 etcd 信息，方便前端调试
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -1136,7 +1217,36 @@ func (s *Server) handleRepairReplication(w http.ResponseWriter, r *http.Request)
 		}
 
 		if actualMaster == nil {
+			// 如果所有节点都是只读，选择配置中角色为 master 的节点
+			log.Printf("[INFO] 所有节点都是只读状态，尝试根据配置角色选择主节点...")
+			for _, info := range nodeInfos {
+				if info.Error == "" && info.Host.IsMasterNode() {
+					actualMaster = info.Host
+					log.Printf("[INFO] 根据配置角色选择主节点: %s (%s)", info.Host.Name, info.Host.IP)
+					break
+				}
+			}
+		}
+
+		if actualMaster == nil {
+			// 最后的备选：选择第一个没有错误的节点
+			log.Printf("[INFO] 尝试选择第一个可用节点作为主节点...")
+			for _, info := range nodeInfos {
+				if info.Error == "" {
+					actualMaster = info.Host
+					log.Printf("[INFO] 选择第一个可用节点作为主节点: %s (%s)", info.Host.Name, info.Host.IP)
+					break
+				}
+			}
+		}
+
+		if actualMaster == nil {
 			log.Printf("[ERROR] 无法确定主节点，修复失败")
+			log.Printf("[ERROR] 节点状态汇总:")
+			for _, info := range nodeInfos {
+				log.Printf("[ERROR]   - %s: read_only=%v, has_repl=%v, error=%s",
+					info.Host.Name, info.IsReadOnly, info.HasRepl, info.Error)
+			}
 			return
 		}
 
@@ -1311,6 +1421,7 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 	nodeID := r.URL.Query().Get("node_id")
+	filter := r.URL.Query().Get("filter") // "all" 显示所有日志，默认过滤掉高频日志
 
 	s.mu.RLock()
 	cluster, ok := s.clusters[id]
@@ -1353,8 +1464,17 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 获取最近的日志
-		output, err := client.Run("tail -20 /var/log/mypatroni/mypatroni.log 2>/dev/null || echo 'No logs available'")
+		// 获取日志 - 默认过滤掉高频的 GET /state 日志，只显示重要日志
+		var logCmd string
+		if filter == "all" {
+			// 显示所有日志
+			logCmd = "tail -50 /var/log/mypatroni/mypatroni.log 2>/dev/null || echo 'No logs available'"
+		} else {
+			// 过滤掉 GET /state 等高频日志，只显示重要日志
+			// 包括：failover、leader、replica、MySQL、repair、error、warn、state change、acquired、promoting、connected、environment
+			logCmd = "grep -iE 'failover|leader|replica|mysql|repair|error|warn|state.change|acquired|promoting|connected|environment|reconfigure|detected|storing' /var/log/mypatroni/mypatroni.log 2>/dev/null | tail -50 || tail -20 /var/log/mypatroni/mypatroni.log 2>/dev/null || echo 'No logs available'"
+		}
+		output, err := client.Run(logCmd)
 		client.Close()
 
 		if err == nil && output != "" {
@@ -1363,14 +1483,30 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 				if line == "" || line == "No logs available" {
 					continue
 				}
+				// 跳过 GET /state 日志（即使在 all 模式下也可以选择跳过）
+				if filter != "all" && strings.Contains(line, "GET /state") {
+					continue
+				}
 				level := "INFO"
 				if strings.Contains(line, "ERROR") {
 					level = "ERROR"
 				} else if strings.Contains(line, "WARN") {
 					level = "WARN"
 				}
+				// 解析 JSON 日志中的时间戳
+				logTime := time.Now().Format("15:04:05")
+				if tsStart := strings.Index(line, `"timestamp":"`); tsStart > 0 {
+					tsStart += 13
+					if tsEnd := strings.Index(line[tsStart:], `"`); tsEnd > 0 {
+						ts := line[tsStart : tsStart+tsEnd]
+						// 解析时间戳，格式如 2025-12-21T11:01:40.303+0800
+						if len(ts) >= 19 {
+							logTime = ts[11:19] // 提取 HH:MM:SS
+						}
+					}
+				}
 				logs = append(logs, LogEntry{
-					Time:    time.Now().Format("15:04:05"),
+					Time:    logTime,
 					Level:   level,
 					Node:    host.Name,
 					Message: line,
