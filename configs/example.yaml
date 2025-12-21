@@ -1,0 +1,61 @@
+# MyPatroni Configuration Example
+# MySQL HA Agent Configuration
+
+# Node name (unique identifier)
+name: mysql-node-1
+
+# Namespace for DCS keys
+namespace: mypatroni
+
+# Cluster scope
+scope: mysql-cluster
+
+# DCS (Distributed Configuration Store) settings
+dcs:
+  endpoints:
+    - "http://etcd1:2379"
+    - "http://etcd2:2379"
+    - "http://etcd3:2379"
+  username: ""
+  password: ""
+  # TLS settings (optional)
+  # tls:
+  #   cert_file: /etc/mypatroni/etcd.crt
+  #   key_file: /etc/mypatroni/etcd.key
+  #   ca_file: /etc/mypatroni/ca.crt
+
+# MySQL connection settings
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "mypatroni"
+  password: "your-password-here"
+  replication_user: "replicator"
+  replication_password: "repl-password-here"
+  data_dir: "/var/lib/mysql"
+
+# API server settings
+api:
+  listen: "0.0.0.0"
+  port: 8080
+  api_key: "your-api-key-here"
+  # TLS settings (optional)
+  # cert_file: /etc/mypatroni/server.crt
+  # key_file: /etc/mypatroni/server.key
+
+# Logging settings
+log:
+  level: "info"  # debug, info, warn, error
+  file: "/var/log/mypatroni/mypatroni.log"
+  max_size: 100      # MB
+  max_backups: 3
+  max_age: 7         # days
+  compress: true
+
+# High Availability settings
+ha:
+  ttl: 30                    # Leader lock TTL in seconds
+  loop_wait: 10              # Main loop interval in seconds
+  retry_timeout: 30          # Retry timeout in seconds
+  max_replication_lag: 10    # Max allowed replication lag for switchover (seconds)
+  failover_cooldown: 60      # Minimum time between failovers (seconds)

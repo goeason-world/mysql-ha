@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # etcd cluster
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.0
+    container_name: etcd
+    environment:
+      - ETCD_NAME=etcd0
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+    ports:
+      - "2379:2379"
+    networks:
+      - mysql-ha
+
+  # MySQL Primary
+  mysql-1:
+    image: mysql:8.0
+    container_name: mysql-1
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_USER: mypatroni
+      MYSQL_PASSWORD: mypatronipass
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql1-data:/var/lib/mysql
+    networks:
+      - mysql-ha
+
+  # MySQL Replica 1
+  mysql-2:
+    image: mysql:8.0
+    container_name: mysql-2
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_USER: mypatroni
+      MYSQL_PASSWORD: mypatronipass
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+      - --read-only=ON
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql2-data:/var/lib/mysql
+    networks:
+      - mysql-ha
+
+  # MySQL Replica 2
+  mysql-3:
+    image: mysql:8.0
+    container_name: mysql-3
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_USER: mypatroni
+      MYSQL_PASSWORD: mypatronipass
+    command:
+      - --server-id=3
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+      - --read-only=ON
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql3-data:/var/lib/mysql
+    networks:
+      - mysql-ha
+
+volumes:
+  mysql1-data:
+  mysql2-data:
+  mysql3-data:
+
+networks:
+  mysql-ha:
+    driver: bridge
