@@ -78,6 +78,10 @@ export const installCluster = (id: string) =>
 export const getInstallStatus = (id: string) =>
   api.get<{ cluster_id: string; hosts: Host[] }>(`/clusters/${id}/install/status`)
 
+// 重试安装
+export const retryInstall = (id: string, nodeIds?: string[], phase?: string) =>
+  api.post(`/clusters/${id}/install/retry`, { node_ids: nodeIds, phase })
+
 // 集群状态和操作
 export interface NodeStatus {
   node_id: string
@@ -85,6 +89,7 @@ export interface NodeStatus {
   ip: string
   role: string
   is_healthy: boolean
+  agent_version?: string
   replication_lag?: number
   install_status: string
 }
@@ -105,6 +110,9 @@ export const switchover = (id: string, targetNodeId: string, reason?: string) =>
 // Agent 管理
 export const upgradeAgents = (id: string, nodeIds: string[]) =>
   api.post(`/clusters/${id}/upgrade-agents`, { node_ids: nodeIds })
+
+export const restartAgents = (id: string, nodeIds: string[]) =>
+  api.post(`/clusters/${id}/restart-agents`, { node_ids: nodeIds })
 
 // 日志
 export interface LogEntry {

@@ -1,12 +1,13 @@
 package installer
 
 import (
-	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -124,38 +125,46 @@ func (c *SSHClient) RunWithSudo(cmd string) (string, error) {
 	return string(output), nil
 }
 
-// UploadFile uploads a file to the remote host using base64 encoding
+// UploadFile uploads a file to the remote host using SFTP
 func (c *SSHClient) UploadFile(localPath, remotePath string) error {
-	// Read local file
-	content, err := os.ReadFile(localPath)
+	// 创建 SFTP 客户端
+	sftpClient, err := sftp.NewClient(c.client)
 	if err != nil {
-		return fmt.Errorf("failed to read local file: %w", err)
+		return fmt.Errorf("failed to create SFTP client: %w", err)
 	}
+	defer sftpClient.Close()
 
-	// Get file permissions
-	stat, err := os.Stat(localPath)
+	// 打开本地文件
+	localFile, err := os.Open(localPath)
 	if err != nil {
-		return fmt.Errorf("failed to stat local file: %w", err)
+		return fmt.Errorf("failed to open local file: %w", err)
 	}
-	perm := stat.Mode().Perm()
+	defer localFile.Close()
 
-	// Encode to base64
-	encoded := base64.StdEncoding.EncodeToString(content)
+	// 先上传到 /tmp 目录（用户有写权限）
+	tmpPath := fmt.Sprintf("/tmp/upload_%d", time.Now().UnixNano())
 
-	// Create a temporary file on remote with base64 content
-	tmpFile := remotePath + ".b64"
-
-	// Write base64 content to temp file (using heredoc to avoid command line length limits)
-	writeCmd := fmt.Sprintf("cat > %s << 'EOF_BASE64'\n%s\nEOF_BASE64", tmpFile, encoded)
-	if _, err := c.RunWithSudo(writeCmd); err != nil {
-		return fmt.Errorf("failed to write base64 content: %w", err)
+	// 创建远程临时文件
+	remoteFile, err := sftpClient.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to create remote file: %w", err)
 	}
 
-	// Decode base64 and write to final location
-	decodeCmd := fmt.Sprintf("base64 -d %s > %s && rm %s && chmod %o %s",
-		tmpFile, remotePath, tmpFile, perm, remotePath)
-	if _, err := c.RunWithSudo(decodeCmd); err != nil {
-		return fmt.Errorf("failed to decode and write file: %w", err)
+	// 复制文件内容
+	_, err = io.Copy(remoteFile, localFile)
+	remoteFile.Close() // 先关闭文件
+	if err != nil {
+		// 清理临时文件
+		sftpClient.Remove(tmpPath)
+		return fmt.Errorf("failed to copy file: %w", err)
+	}
+
+	// 使用 sudo mv 移动到目标位置
+	mvCmd := fmt.Sprintf("mv %s %s && chmod 644 %s", tmpPath, remotePath, remotePath)
+	if _, err := c.RunWithSudo(mvCmd); err != nil {
+		// 清理临时文件
+		sftpClient.Remove(tmpPath)
+		return fmt.Errorf("failed to move file to destination: %w", err)
 	}
 
 	return nil

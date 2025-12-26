@@ -3,11 +3,15 @@ package webapi
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,15 +22,24 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// AgentVersionInfo stores the agent version information
+type AgentVersionInfo struct {
+	Version    string `json:"version"`     // 当前版本号，如 "1.0.3"
+	BinaryHash string `json:"binary_hash"` // mypatroni 二进制文件的 MD5 hash
+	UpdatedAt  string `json:"updated_at"`  // 最后更新时间
+}
+
 // Server is the web management API server
 type Server struct {
-	router       *mux.Router
-	server       *http.Server
-	installer    *installer.Installer
-	clusters     map[string]*installer.ClusterConfig
-	mu           sync.RWMutex
-	dataDir      string
-	clustersFile string
+	router           *mux.Router
+	server           *http.Server
+	installer        *installer.Installer
+	clusters         map[string]*installer.ClusterConfig
+	mu               sync.RWMutex
+	dataDir          string
+	clustersFile     string
+	agentVersion     *AgentVersionInfo
+	agentVersionFile string
 }
 
 // NewServer creates a new web API server
@@ -35,11 +48,13 @@ func NewServer(addr string) *Server {
 	os.MkdirAll(dataDir, 0755)
 
 	s := &Server{
-		router:       mux.NewRouter(),
-		installer:    installer.NewInstaller(),
-		clusters:     make(map[string]*installer.ClusterConfig),
-		dataDir:      dataDir,
-		clustersFile: dataDir + "/clusters.json",
+		router:           mux.NewRouter(),
+		installer:        installer.NewInstaller(),
+		clusters:         make(map[string]*installer.ClusterConfig),
+		dataDir:          dataDir,
+		clustersFile:     dataDir + "/clusters.json",
+		agentVersionFile: dataDir + "/agent_version.json",
+		agentVersion:     &AgentVersionInfo{Version: "1.0.0"},
 	}
 
 	s.server = &http.Server{
@@ -54,6 +69,11 @@ func NewServer(addr string) *Server {
 	// 加载已有的集群配置
 	if err := s.loadClusters(); err != nil {
 		log.Printf("[WARN] Failed to load clusters: %v", err)
+	}
+
+	// 加载 Agent 版本信息
+	if err := s.loadAgentVersion(); err != nil {
+		log.Printf("[WARN] Failed to load agent version: %v", err)
 	}
 
 	return s
@@ -81,12 +101,14 @@ func (s *Server) setupRoutes() {
 	// Installation
 	api.HandleFunc("/clusters/{id}/install", s.handleInstallCluster).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/install/status", s.handleInstallStatus).Methods("GET", "OPTIONS")
+	api.HandleFunc("/clusters/{id}/install/retry", s.handleRetryInstall).Methods("POST", "OPTIONS")
 
 	// Cluster operations
 	api.HandleFunc("/clusters/{id}/status", s.handleClusterStatus).Methods("GET", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/switchover", s.handleSwitchover).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/init-mysql-accounts", s.handleInitMySQLAccounts).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/upgrade-agents", s.handleUpgradeAgents).Methods("POST", "OPTIONS")
+	api.HandleFunc("/clusters/{id}/restart-agents", s.handleRestartAgents).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/logs", s.handleGetLogs).Methods("GET", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/repair-replication", s.handleRepairReplication).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/nodes/{nodeId}/repair", s.handleRepairNode).Methods("POST", "OPTIONS")
@@ -331,6 +353,211 @@ func (s *Server) handleInstallStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRetryInstall handles retry installation for failed nodes
+func (s *Server) handleRetryInstall(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	s.mu.RLock()
+	cluster, ok := s.clusters[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		writeError(w, http.StatusNotFound, "cluster not found")
+		return
+	}
+
+	var req struct {
+		NodeIDs []string `json:"node_ids"` // 可选，指定要重试的节点，为空则重试所有失败节点
+		Phase   string   `json:"phase"`    // 可选，指定要重试的阶段: etcd, mysql, agent
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	// 找出需要重试的节点
+	var nodesToRetry []*installer.Host
+	for i := range cluster.Hosts {
+		host := &cluster.Hosts[i]
+		// 如果指定了节点列表，只重试指定的节点
+		if len(req.NodeIDs) > 0 {
+			found := false
+			for _, nodeID := range req.NodeIDs {
+				if host.ID == nodeID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		// 只重试失败或未完成的节点
+		if host.Status != "completed" {
+			nodesToRetry = append(nodesToRetry, host)
+		}
+	}
+
+	if len(nodesToRetry) == 0 {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "skipped",
+			"message": "No failed nodes to retry",
+		})
+		return
+	}
+
+	// 在后台执行重试
+	go func() {
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] 开始重试安装 %d 个节点", len(nodesToRetry))
+		log.Printf("[INFO] ========================================")
+
+		for _, host := range nodesToRetry {
+			log.Printf("[INFO] 重试节点: %s (%s)", host.Name, host.IP)
+
+			// 根据阶段或节点角色决定重试什么
+			if req.Phase == "etcd" || (req.Phase == "" && host.IsEtcdNode() && host.Status != "completed") {
+				s.retryEtcdInstall(cluster, host)
+			}
+			if req.Phase == "mysql" || (req.Phase == "" && host.IsMySQLNode() && host.Status != "completed") {
+				s.retryMySQLInstall(cluster, host)
+			}
+			if req.Phase == "agent" || req.Phase == "" {
+				s.retryAgentInstall(cluster, host)
+			}
+		}
+
+		log.Printf("[INFO] 重试安装完成")
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":  "started",
+		"message": fmt.Sprintf("Retrying installation for %d nodes", len(nodesToRetry)),
+	})
+}
+
+// retryEtcdInstall retries etcd installation for a single node
+func (s *Server) retryEtcdInstall(cluster *installer.ClusterConfig, host *installer.Host) {
+	var etcdNodes []installer.Host
+	for _, h := range cluster.Hosts {
+		if h.IsEtcdNode() {
+			etcdNodes = append(etcdNodes, h)
+		}
+	}
+
+	// 获取下载 URL
+	var downloadURL string
+	for _, v := range installer.EtcdVersions {
+		if v.Version == cluster.EtcdVersion {
+			downloadURL = v.DownloadURL
+			break
+		}
+	}
+
+	// 先下载到本地缓存
+	log.Printf("[INFO] [%s] 检查/下载 etcd 到本地缓存...", host.Name)
+	localPath, err := s.installer.DownloadToLocal(downloadURL, fmt.Sprintf("etcd-v%s.tar.gz", cluster.EtcdVersion), func(progress int, msg string) {
+		log.Printf("[INFO] etcd 下载: %d%% - %s", progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] etcd 下载失败: %v", err)
+		host.Status = "failed"
+		s.saveClusters()
+		return
+	}
+
+	log.Printf("[INFO] [%s] 重试 etcd 安装...", host.Name)
+	err = s.installer.InstallEtcd(host, cluster.EtcdVersion, cluster.InstallPath, etcdNodes, localPath, func(progress int, msg string) {
+		log.Printf("[INFO] [%s] etcd: %d%% - %s", host.Name, progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] [%s] etcd 安装失败: %v", host.Name, err)
+		host.Status = "failed"
+	} else {
+		log.Printf("[INFO] [%s] etcd 安装成功", host.Name)
+	}
+	s.saveClusters()
+}
+
+// retryMySQLInstall retries MySQL installation for a single node
+func (s *Server) retryMySQLInstall(cluster *installer.ClusterConfig, host *installer.Host) {
+	// 获取下载 URL
+	var downloadURL string
+	allVersions := append(installer.MySQL57Versions, installer.MySQL80Versions...)
+	for _, v := range allVersions {
+		if v.Version == cluster.MySQLVersion {
+			downloadURL = v.DownloadURL
+			break
+		}
+	}
+
+	// 确定文件扩展名
+	ext := "tar.gz"
+	if strings.Contains(downloadURL, ".tar.xz") {
+		ext = "tar.xz"
+	}
+
+	// 先下载到本地缓存
+	log.Printf("[INFO] [%s] 检查/下载 MySQL 到本地缓存...", host.Name)
+	localPath, err := s.installer.DownloadToLocal(downloadURL, fmt.Sprintf("mysql-%s.%s", cluster.MySQLVersion, ext), func(progress int, msg string) {
+		log.Printf("[INFO] MySQL 下载: %d%% - %s", progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] MySQL 下载失败: %v", err)
+		host.Status = "failed"
+		s.saveClusters()
+		return
+	}
+
+	log.Printf("[INFO] [%s] 重试 MySQL 安装...", host.Name)
+	err = s.installer.InstallMySQL(host, cluster.MySQLVersion, cluster.InstallPath, cluster.DataPath, cluster.Settings, localPath, func(progress int, msg string) {
+		log.Printf("[INFO] [%s] MySQL: %d%% - %s", host.Name, progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] [%s] MySQL 安装失败: %v", host.Name, err)
+		host.Status = "failed"
+	} else {
+		log.Printf("[INFO] [%s] MySQL 安装成功", host.Name)
+	}
+	s.saveClusters()
+}
+
+// retryAgentInstall retries HA Agent installation for a single node
+func (s *Server) retryAgentInstall(cluster *installer.ClusterConfig, host *installer.Host) {
+	agentBinary := "./mypatroni"
+	if _, err := os.Stat(agentBinary); err != nil {
+		log.Printf("[ERROR] mypatroni binary not found")
+		return
+	}
+
+	// 检查并更新 Agent 版本号
+	s.checkAndUpdateAgentVersion()
+	cluster.AgentVersion = s.GetAgentVersion()
+	log.Printf("[INFO] [%s] 重试 HA Agent 安装 (版本: %s)...", host.Name, cluster.AgentVersion)
+
+	// 先安装配置
+	err := s.installer.InstallHAAgent(host, cluster.InstallPath, cluster, func(progress int, msg string) {
+		log.Printf("[INFO] [%s] Agent config: %d%% - %s", host.Name, progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] [%s] Agent 配置失败: %v", host.Name, err)
+		host.Status = "failed"
+		s.saveClusters()
+		return
+	}
+
+	// 上传并启动
+	err = s.installer.UploadAndStartHAAgentWithConfig(host, cluster.InstallPath, agentBinary, cluster, func(progress int, msg string) {
+		log.Printf("[INFO] [%s] Agent: %d%% - %s", host.Name, progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] [%s] Agent 启动失败: %v", host.Name, err)
+		host.Status = "failed"
+	} else {
+		log.Printf("[INFO] [%s] Agent 安装成功", host.Name)
+		host.Status = "completed"
+	}
+	s.saveClusters()
+}
+
 // installResult holds the result of a concurrent installation
 type installResult struct {
 	hostID string
@@ -440,6 +667,10 @@ func (s *Server) runInstallation(cluster *installer.ClusterConfig) {
 		return
 	}
 
+	// 设置集群的 Agent 版本号（使用 webadmin 管理的最新版本）
+	cluster.AgentVersion = s.GetAgentVersion()
+	log.Printf("[INFO] 使用 Agent 版本: %s", cluster.AgentVersion)
+
 	if !s.installAgentConcurrent(cluster, mysqlNodes, agentBinary) {
 		log.Printf("[ERROR] HA Agent 部署失败")
 		s.updateClusterPhase(cluster.ID, "failed_phase4")
@@ -470,8 +701,34 @@ func (s *Server) updateClusterPhase(clusterID, phase string) {
 	}
 }
 
-// installEtcdConcurrent installs etcd on all nodes concurrently
+// installEtcdConcurrent installs etcd on all nodes
+// 优化：先下载到 webadmin 本地，然后并发上传到各节点
 func (s *Server) installEtcdConcurrent(cluster *installer.ClusterConfig, etcdNodes []installer.Host) bool {
+	if len(etcdNodes) == 0 {
+		return true
+	}
+
+	// 获取下载 URL
+	var downloadURL string
+	for _, v := range installer.EtcdVersions {
+		if v.Version == cluster.EtcdVersion {
+			downloadURL = v.DownloadURL
+			break
+		}
+	}
+
+	// 先下载到本地缓存
+	log.Printf("[INFO] 下载 etcd 到本地缓存...")
+	localPath, err := s.installer.DownloadToLocal(downloadURL, fmt.Sprintf("etcd-v%s.tar.gz", cluster.EtcdVersion), func(progress int, msg string) {
+		log.Printf("[INFO] etcd 下载: %d%% - %s", progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] etcd 下载失败: %v", err)
+		return false
+	}
+	log.Printf("[INFO] etcd 已缓存到: %s", localPath)
+
+	// 并发安装到所有节点
 	var wg sync.WaitGroup
 	results := make(chan installResult, len(etcdNodes))
 
@@ -488,7 +745,7 @@ func (s *Server) installEtcdConcurrent(cluster *installer.ClusterConfig, etcdNod
 			log.Printf("[INFO] [%s] 开始安装 etcd...", h.Name)
 			s.updateHostStatus(cluster.ID, h.ID, "installing_etcd")
 
-			err := s.installer.InstallEtcd(h, cluster.EtcdVersion, cluster.InstallPath, etcdNodes, func(progress int, msg string) {
+			err := s.installer.InstallEtcd(h, cluster.EtcdVersion, cluster.InstallPath, etcdNodes, localPath, func(progress int, msg string) {
 				log.Printf("[INFO] [%s] etcd: %d%% - %s", h.Name, progress, msg)
 			})
 
@@ -522,8 +779,41 @@ func (s *Server) installEtcdConcurrent(cluster *installer.ClusterConfig, etcdNod
 	return !hasError
 }
 
-// installMySQLConcurrent installs MySQL on all nodes concurrently
+// installMySQLConcurrent installs MySQL on all nodes
+// 优化：先下载到 webadmin 本地，然后并发上传到各节点
 func (s *Server) installMySQLConcurrent(cluster *installer.ClusterConfig, mysqlNodes []*installer.Host) bool {
+	if len(mysqlNodes) == 0 {
+		return true
+	}
+
+	// 获取下载 URL
+	var downloadURL string
+	allVersions := append(installer.MySQL57Versions, installer.MySQL80Versions...)
+	for _, v := range allVersions {
+		if v.Version == cluster.MySQLVersion {
+			downloadURL = v.DownloadURL
+			break
+		}
+	}
+
+	// 确定文件扩展名
+	ext := "tar.gz"
+	if strings.Contains(downloadURL, ".tar.xz") {
+		ext = "tar.xz"
+	}
+
+	// 先下载到本地缓存
+	log.Printf("[INFO] 下载 MySQL 到本地缓存...")
+	localPath, err := s.installer.DownloadToLocal(downloadURL, fmt.Sprintf("mysql-%s.%s", cluster.MySQLVersion, ext), func(progress int, msg string) {
+		log.Printf("[INFO] MySQL 下载: %d%% - %s", progress, msg)
+	})
+	if err != nil {
+		log.Printf("[ERROR] MySQL 下载失败: %v", err)
+		return false
+	}
+	log.Printf("[INFO] MySQL 已缓存到: %s", localPath)
+
+	// 并发安装到所有节点
 	var wg sync.WaitGroup
 	results := make(chan installResult, len(mysqlNodes))
 
@@ -535,7 +825,7 @@ func (s *Server) installMySQLConcurrent(cluster *installer.ClusterConfig, mysqlN
 			log.Printf("[INFO] [%s] 开始安装 MySQL...", h.Name)
 			s.updateHostStatus(cluster.ID, h.ID, "installing_mysql")
 
-			err := s.installer.InstallMySQL(h, cluster.MySQLVersion, cluster.InstallPath, cluster.DataPath, cluster.Settings, func(progress int, msg string) {
+			err := s.installer.InstallMySQL(h, cluster.MySQLVersion, cluster.InstallPath, cluster.DataPath, cluster.Settings, localPath, func(progress int, msg string) {
 				log.Printf("[INFO] [%s] MySQL: %d%% - %s", h.Name, progress, msg)
 			})
 
@@ -656,13 +946,32 @@ func (s *Server) updateHostStatus(clusterID, hostID, status string) {
 				break
 			}
 		}
-		// 异步保存到磁盘（避免阻塞安装流程）
-		go func() {
-			if err := s.saveClusters(); err != nil {
-				log.Printf("[ERROR] Failed to save clusters: %v", err)
-			}
-		}()
+		// 同步保存到磁盘（确保状态一致性）
+		if err := s.saveClustersSafe(); err != nil {
+			log.Printf("[ERROR] Failed to save clusters: %v", err)
+		}
 	}
+}
+
+// saveClustersSafe saves clusters without acquiring lock (caller must hold lock)
+func (s *Server) saveClustersSafe() error {
+	// 确保 data 目录存在
+	if err := os.MkdirAll(s.dataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(s.clusters, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal clusters: %w", err)
+	}
+
+	// 直接写入文件
+	if err := os.WriteFile(s.clustersFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write clusters file: %w", err)
+	}
+
+	log.Printf("[INFO] Saved %d clusters to disk", len(s.clusters))
+	return nil
 }
 
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
@@ -687,6 +996,7 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		IsHealthy      bool   `json:"is_healthy"`
 		MySQLHealthy   bool   `json:"mysql_healthy"`
 		AgentHealthy   bool   `json:"agent_healthy"`
+		AgentVersion   string `json:"agent_version,omitempty"`
 		ReplicationLag int    `json:"replication_lag,omitempty"`
 		InstallStatus  string `json:"install_status"`
 	}
@@ -769,6 +1079,7 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 				Role         string `json:"role"`
 				IsHealthy    bool   `json:"is_healthy"` // 这是 MySQL 的健康状态
 				GTIDExecuted string `json:"gtid_executed"`
+				AgentVersion string `json:"agent_version"`
 			}
 			if json.NewDecoder(resp.Body).Decode(&agentState) == nil {
 				// IsHealthy 是 Agent 报告的 MySQL 健康状态
@@ -779,7 +1090,9 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 				} else if agentState.Role == "replica" {
 					node.Role = "replica"
 				}
-				log.Printf("[DEBUG] Agent %s 报告: role=%s, mysql_healthy=%v", host.Name, agentState.Role, agentState.IsHealthy)
+				// 获取 Agent 版本
+				node.AgentVersion = agentState.AgentVersion
+				log.Printf("[DEBUG] Agent %s 报告: role=%s, mysql_healthy=%v, version=%s", host.Name, agentState.Role, agentState.IsHealthy, agentState.AgentVersion)
 			}
 			resp.Body.Close()
 		} else {
@@ -797,8 +1110,8 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 综合健康状态：Agent 健康即可显示为在线
-		node.IsHealthy = node.AgentHealthy
+		// 综合健康状态：Agent 健康且 MySQL 健康才显示为在线
+		node.IsHealthy = node.AgentHealthy && node.MySQLHealthy
 
 		// 角色判断优先级：agent 报告 > etcd leader_info > 配置文件
 		// 如果 agent 已经报告了角色，保持不变（agent 持有锁才会报告 leader）
@@ -1095,7 +1408,133 @@ func (s *Server) loadClusters() error {
 	return nil
 }
 
+// loadAgentVersion loads agent version info from disk
+func (s *Server) loadAgentVersion() error {
+	data, err := os.ReadFile(s.agentVersionFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("[INFO] No existing agent version file found, initializing with default")
+			// 检查当前二进制文件并初始化版本
+			s.checkAndUpdateAgentVersion()
+			return nil
+		}
+		return fmt.Errorf("failed to read agent version file: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := json.Unmarshal(data, &s.agentVersion); err != nil {
+		return fmt.Errorf("failed to unmarshal agent version: %w", err)
+	}
+
+	log.Printf("[INFO] Loaded agent version: %s (hash: %s)", s.agentVersion.Version, s.agentVersion.BinaryHash)
+
+	// 检查二进制文件是否有更新
+	s.mu.Unlock()
+	s.checkAndUpdateAgentVersion()
+	s.mu.Lock()
+
+	return nil
+}
+
+// saveAgentVersion saves agent version info to disk
+func (s *Server) saveAgentVersion() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	data, err := json.MarshalIndent(s.agentVersion, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal agent version: %w", err)
+	}
+
+	if err := os.WriteFile(s.agentVersionFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write agent version file: %w", err)
+	}
+
+	log.Printf("[INFO] Saved agent version: %s", s.agentVersion.Version)
+	return nil
+}
+
+// calculateBinaryHash calculates MD5 hash of the agent binary
+func (s *Server) calculateBinaryHash(binaryPath string) (string, error) {
+	file, err := os.Open(binaryPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// incrementVersion increments the patch version number
+func (s *Server) incrementVersion(version string) string {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return "1.0.1"
+	}
+
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		patch = 0
+	}
+	patch++
+
+	return fmt.Sprintf("%s.%s.%d", parts[0], parts[1], patch)
+}
+
+// checkAndUpdateAgentVersion checks if agent binary has changed and updates version
+func (s *Server) checkAndUpdateAgentVersion() {
+	agentBinary := "./mypatroni"
+
+	newHash, err := s.calculateBinaryHash(agentBinary)
+	if err != nil {
+		log.Printf("[WARN] Failed to calculate agent binary hash: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.agentVersion.BinaryHash == "" {
+		// 首次初始化
+		s.agentVersion.BinaryHash = newHash
+		s.agentVersion.UpdatedAt = time.Now().Format(time.RFC3339)
+		log.Printf("[INFO] Initialized agent version: %s (hash: %s)", s.agentVersion.Version, newHash)
+	} else if s.agentVersion.BinaryHash != newHash {
+		// 二进制文件已更新，递增版本号
+		oldVersion := s.agentVersion.Version
+		s.agentVersion.Version = s.incrementVersion(oldVersion)
+		s.agentVersion.BinaryHash = newHash
+		s.agentVersion.UpdatedAt = time.Now().Format(time.RFC3339)
+		log.Printf("[INFO] Agent binary changed, version incremented: %s -> %s", oldVersion, s.agentVersion.Version)
+	} else {
+		log.Printf("[INFO] Agent binary unchanged, version: %s", s.agentVersion.Version)
+		return
+	}
+
+	// 保存更新后的版本信息
+	s.mu.Unlock()
+	if err := s.saveAgentVersion(); err != nil {
+		log.Printf("[ERROR] Failed to save agent version: %v", err)
+	}
+	s.mu.Lock()
+}
+
+// GetAgentVersion returns the current agent version
+func (s *Server) GetAgentVersion() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.agentVersion.Version
+}
+
 // handleUpgradeAgents handles agent upgrade requests
+// 智能滚动更新：先更新从节点，最后更新主节点（避免不必要的选举）
 func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
@@ -1124,8 +1563,71 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 在后台执行更新
+	// 检查并更新 Agent 版本号（如果二进制文件有变化）
+	s.checkAndUpdateAgentVersion()
+	currentVersion := s.GetAgentVersion()
+
+	// 更新集群的 Agent 版本号
+	s.mu.Lock()
+	cluster.AgentVersion = currentVersion
+	s.mu.Unlock()
+
+	// 保存集群配置
+	if err := s.saveClusters(); err != nil {
+		log.Printf("[ERROR] Failed to save cluster config: %v", err)
+	}
+
+	log.Printf("[INFO] Agent version for upgrade: %s", currentVersion)
+
+	// 在后台执行智能滚动更新
 	go func() {
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] 开始智能滚动更新 HA Agent (版本: %s)", currentVersion)
+		log.Printf("[INFO] ========================================")
+
+		// Step 1: 获取当前 leader 信息
+		var leaderNodeID string
+		var leaderHost *installer.Host
+
+		// 从 etcd 获取 leader_info
+		for _, host := range cluster.Hosts {
+			if host.IsEtcdNode() {
+				sshClient, err := installer.NewSSHClient(&host)
+				if err != nil {
+					continue
+				}
+				key := fmt.Sprintf("/mypatroni/%s/leader_info", cluster.Name)
+				etcdCmd := fmt.Sprintf("etcdctl get '%s' --print-value-only 2>/dev/null || /usr/local/bin/etcdctl get '%s' --print-value-only 2>/dev/null", key, key)
+				output, err := sshClient.Run(etcdCmd)
+				sshClient.Close()
+
+				if err == nil && strings.TrimSpace(output) != "" {
+					// 解析 leader host
+					leaderInfo := strings.TrimSpace(output)
+					if hostStart := strings.Index(leaderInfo, `"host":"`); hostStart > 0 {
+						hostStart += 8
+						if hostEnd := strings.Index(leaderInfo[hostStart:], `"`); hostEnd > 0 {
+							leaderIP := leaderInfo[hostStart : hostStart+hostEnd]
+							// 找到对应的 host
+							for i := range cluster.Hosts {
+								if cluster.Hosts[i].IP == leaderIP {
+									leaderHost = &cluster.Hosts[i]
+									leaderNodeID = cluster.Hosts[i].ID
+									log.Printf("[INFO] 当前 Leader: %s (%s)", leaderHost.Name, leaderHost.IP)
+									break
+								}
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// Step 2: 分离要更新的节点为 leader 和 replicas
+		var replicaNodesToUpdate []*installer.Host
+		var leaderNeedsUpdate bool
+
 		for _, nodeID := range req.NodeIDs {
 			var targetHost *installer.Host
 			for i := range cluster.Hosts {
@@ -1138,8 +1640,18 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			log.Printf("[INFO] Upgrading HA Agent on %s (%s)", targetHost.Name, targetHost.IP)
-			err := s.installer.UploadAndStartHAAgent(targetHost, cluster.InstallPath, agentBinary, func(progress int, msg string) {
+			if nodeID == leaderNodeID {
+				leaderNeedsUpdate = true
+				log.Printf("[INFO] Leader 节点 %s 需要更新，将最后处理", targetHost.Name)
+			} else {
+				replicaNodesToUpdate = append(replicaNodesToUpdate, targetHost)
+			}
+		}
+
+		// Step 3: 先更新所有从节点（串行，避免同时重启多个节点）
+		for _, targetHost := range replicaNodesToUpdate {
+			log.Printf("[INFO] 更新从节点 Agent: %s (%s)", targetHost.Name, targetHost.IP)
+			err := s.installer.UploadAndStartHAAgentWithConfig(targetHost, cluster.InstallPath, agentBinary, cluster, func(progress int, msg string) {
 				log.Printf("[INFO] [%s] Agent upgrade: %d%% - %s", targetHost.Name, progress, msg)
 			})
 			if err != nil {
@@ -1147,12 +1659,131 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 			} else {
 				log.Printf("[INFO] [%s] Agent upgrade completed", targetHost.Name)
 			}
+			// 等待 Agent 重启完成
+			time.Sleep(3 * time.Second)
 		}
+
+		// Step 4: 最后更新 Leader 节点
+		if leaderNeedsUpdate && leaderHost != nil {
+			log.Printf("[INFO] ========================================")
+			log.Printf("[INFO] 开始更新 Leader 节点: %s", leaderHost.Name)
+			log.Printf("[INFO] ========================================")
+
+			// 如果有其他从节点，先做 switchover
+			if len(replicaNodesToUpdate) > 0 {
+				// 选择第一个健康的从节点作为新 leader
+				newLeader := replicaNodesToUpdate[0]
+				log.Printf("[INFO] 先将 Leader 切换到 %s，避免选举", newLeader.Name)
+
+				// 调用 demote API 让当前 leader 释放锁
+				client := &http.Client{Timeout: 30 * time.Second}
+				demoteURL := fmt.Sprintf("http://%s:%d/api/v1/demote", leaderHost.IP, cluster.Settings.HAAgentPort)
+				resp, err := client.Post(demoteURL, "application/json", strings.NewReader(`{"reason":"agent upgrade"}`))
+				if err != nil {
+					log.Printf("[WARN] Demote 请求失败: %v，继续更新", err)
+				} else {
+					resp.Body.Close()
+					log.Printf("[INFO] Leader 已 demote，等待新 leader 选举...")
+					time.Sleep(5 * time.Second)
+				}
+			}
+
+			// 更新原 leader 节点
+			err := s.installer.UploadAndStartHAAgentWithConfig(leaderHost, cluster.InstallPath, agentBinary, cluster, func(progress int, msg string) {
+				log.Printf("[INFO] [%s] Agent upgrade: %d%% - %s", leaderHost.Name, progress, msg)
+			})
+			if err != nil {
+				log.Printf("[ERROR] [%s] Agent upgrade failed: %v", leaderHost.Name, err)
+			} else {
+				log.Printf("[INFO] [%s] Agent upgrade completed", leaderHost.Name)
+			}
+		}
+
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] 智能滚动更新完成 (版本: %s)", currentVersion)
+		log.Printf("[INFO] ========================================")
 	}()
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":  "started",
-		"message": fmt.Sprintf("Upgrading %d agents", len(req.NodeIDs)),
+		"message": fmt.Sprintf("Upgrading %d agents (rolling update)", len(req.NodeIDs)),
+	})
+}
+
+// handleRestartAgents handles agent restart requests (without uploading new binary)
+// 只重启 Agent 服务，不上传新的二进制文件
+func (s *Server) handleRestartAgents(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	s.mu.RLock()
+	cluster, ok := s.clusters[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		writeError(w, http.StatusNotFound, "cluster not found")
+		return
+	}
+
+	var req struct {
+		NodeIDs []string `json:"node_ids"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// 在后台执行重启
+	go func() {
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] 开始重启 HA Agent")
+		log.Printf("[INFO] ========================================")
+
+		for _, nodeID := range req.NodeIDs {
+			var targetHost *installer.Host
+			for i := range cluster.Hosts {
+				if cluster.Hosts[i].ID == nodeID {
+					targetHost = &cluster.Hosts[i]
+					break
+				}
+			}
+			if targetHost == nil {
+				log.Printf("[WARN] Node %s not found", nodeID)
+				continue
+			}
+
+			log.Printf("[INFO] 重启 Agent: %s (%s)", targetHost.Name, targetHost.IP)
+
+			sshClient, err := installer.NewSSHClient(targetHost)
+			if err != nil {
+				log.Printf("[ERROR] [%s] SSH 连接失败: %v", targetHost.Name, err)
+				continue
+			}
+
+			// 重启 mypatroni 服务
+			restartCmd := "sudo systemctl restart mypatroni"
+			output, err := sshClient.Run(restartCmd)
+			sshClient.Close()
+
+			if err != nil {
+				log.Printf("[ERROR] [%s] Agent 重启失败: %v, output: %s", targetHost.Name, err, output)
+			} else {
+				log.Printf("[INFO] [%s] Agent 重启成功", targetHost.Name)
+			}
+
+			// 等待 Agent 重启完成
+			time.Sleep(2 * time.Second)
+		}
+
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] Agent 重启完成")
+		log.Printf("[INFO] ========================================")
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":  "started",
+		"message": fmt.Sprintf("Restarting %d agents", len(req.NodeIDs)),
 	})
 }
 

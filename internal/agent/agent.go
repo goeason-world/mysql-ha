@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"sync"
@@ -14,6 +15,9 @@ import (
 	"mysql-ha/internal/log"
 	"mysql-ha/internal/mysql"
 )
+
+// DefaultVersion is the fallback version if not configured
+const DefaultVersion = "1.0.0"
 
 // Agent is the core HA agent running on each MySQL node
 type Agent struct {
@@ -27,7 +31,17 @@ type Agent struct {
 	mu             sync.RWMutex
 	mysqlConnected bool
 	dcsConnected   bool
-	lastLeaderHost string // 缓存上次的 leader host，用于检测 leader 变更
+	lastLeaderHost string    // 缓存上次的 leader host，用于检测 leader 变更
+	startTime      time.Time // Agent 启动时间，用于判断是否刚启动
+	wasLeader      bool      // 标记自己之前是否是 leader（通过 leader_info 判断）
+}
+
+// getVersion returns the agent version from config or default
+func getVersion(cfg *config.Config) string {
+	if cfg.Version != "" {
+		return cfg.Version
+	}
+	return DefaultVersion
 }
 
 // NewAgent creates a new HA Agent
@@ -39,11 +53,13 @@ func NewAgent(cfg *config.Config, d dcs.DCS, mysqlMgr *mysql.Manager, logger *lo
 		mysql:  mysqlMgr,
 		logger: logger,
 		state: &NodeState{
-			NodeID:   cfg.Name,
-			Hostname: hostname,
-			Role:     RoleUnknown,
+			NodeID:       cfg.Name,
+			Hostname:     hostname,
+			Role:         RoleUnknown,
+			AgentVersion: getVersion(cfg),
 		},
-		stopCh: make(chan struct{}),
+		stopCh:    make(chan struct{}),
+		startTime: time.Now(),
 	}
 }
 
@@ -73,6 +89,10 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 	a.lockManager = election.NewLockManager(a.dcs, lockKey, ttl)
 
+	// 快速恢复检查：如果 etcd 中的 leader_info 指向自己，说明自己之前是 leader
+	// 应该立即尝试获取锁，避免不必要的选举
+	a.tryQuickLeaderRecovery(ctx)
+
 	// Register with DCS
 	if err := a.register(ctx); err != nil {
 		a.logger.Warn(fmt.Sprintf("failed to register initially: %v, will retry", err))
@@ -83,6 +103,100 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	a.logger.Info("HA agent started")
 	return nil
+}
+
+// tryQuickLeaderRecovery 尝试快速恢复 leader 身份
+// 如果 etcd 中的 leader_info 指向自己，说明自己之前是 leader，应该立即尝试获取锁
+// 这个函数是防止 Agent 重启触发不必要选举的关键
+func (a *Agent) tryQuickLeaderRecovery(ctx context.Context) {
+	myHost := a.getMyHost()
+
+	// 检查 etcd 中的 leader_info
+	_, leaderHost, _, err := a.getLeaderInfo(ctx)
+	if err != nil {
+		a.logger.Debug(fmt.Sprintf("no leader info in etcd: %v", err))
+		return
+	}
+
+	if leaderHost != myHost {
+		a.logger.Debug(fmt.Sprintf("leader_info points to %s, not me (%s)", leaderHost, myHost))
+		return
+	}
+
+	// leader_info 指向自己，标记自己之前是 leader
+	a.mu.Lock()
+	a.wasLeader = true
+	a.mu.Unlock()
+
+	a.logger.Info(fmt.Sprintf("leader_info points to me (%s), attempting quick leader recovery", myHost))
+
+	// 等待 MySQL 连接（最多 30 秒，给足够时间让 MySQL 启动）
+	maxWait := 60
+	for i := 0; i < maxWait; i++ {
+		a.mu.RLock()
+		connected := a.mysqlConnected
+		a.mu.RUnlock()
+		if connected {
+			break
+		}
+		if i%10 == 0 {
+			a.logger.Info(fmt.Sprintf("waiting for MySQL connection for leader recovery... (%d/%d)", i, maxWait))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// 检查 MySQL 是否健康
+	if err := a.mysql.Ping(); err != nil {
+		a.logger.Warn(fmt.Sprintf("MySQL not healthy, cannot recover as leader: %v", err))
+		return
+	}
+
+	// 检查 MySQL 是否是 read-write 模式（之前是 master）
+	readOnly, err := a.mysql.IsReadOnly()
+	if err != nil {
+		a.logger.Warn(fmt.Sprintf("failed to check read-only status: %v", err))
+	} else if readOnly {
+		a.logger.Info("MySQL is read-only, was likely a replica, not recovering as leader")
+		a.mu.Lock()
+		a.wasLeader = false
+		a.mu.Unlock()
+		return
+	}
+
+	// 多次尝试获取锁（旧锁可能还没过期，需要等待）
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		acquired, err := a.lockManager.TryAcquire(ctx)
+		if err != nil {
+			a.logger.Warn(fmt.Sprintf("failed to acquire lock during quick recovery (attempt %d/%d): %v", i+1, maxRetries, err))
+			time.Sleep(time.Second)
+			continue
+		}
+
+		if acquired {
+			a.logger.Info("quick leader recovery successful, acquired leadership lock")
+			// 确保 MySQL 是 read-write
+			if err := a.mysql.SetReadOnly(false); err != nil {
+				a.logger.Error(fmt.Sprintf("failed to set read-write: %v", err))
+			}
+			// 更新状态
+			a.mu.Lock()
+			a.state.Role = RoleLeader
+			a.state.ReplicationInfo = nil
+			a.mu.Unlock()
+			// 启动锁续约
+			a.lockManager.StartRenewal(ctx)
+			// 更新 leader_info（刷新时间戳）
+			a.storeLeaderInfo(ctx)
+			return
+		}
+
+		// 锁被其他节点持有，等待一下再试
+		a.logger.Debug(fmt.Sprintf("lock held by another node during recovery, waiting... (attempt %d/%d)", i+1, maxRetries))
+		time.Sleep(time.Second)
+	}
+
+	a.logger.Info("quick leader recovery failed after retries, will participate in normal election")
 }
 
 // connectDCSWithRetry connects to DCS with exponential backoff
@@ -170,16 +284,20 @@ func (a *Agent) connectMySQLWithRetry(ctx context.Context) {
 }
 
 // Stop stops the agent
+// 优雅关闭时不释放 etcd 锁，避免触发不必要的选举
+// 锁会在 TTL 过期后自动释放，或者 Agent 重启后继续持有
 func (a *Agent) Stop() error {
-	a.logger.Info("stopping HA agent")
+	a.logger.Info("stopping HA agent (graceful shutdown, keeping etcd lock)")
 
 	close(a.stopCh)
 
 	if a.lockManager != nil {
+		// 只停止续约，不释放锁
+		// 这样如果是升级重启，Agent 可以在 TTL 内重新启动并继续持有锁
+		// 如果是真正的故障，锁会在 TTL 后自动过期，其他节点可以接管
 		a.lockManager.StopRenewal()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		a.lockManager.Release(ctx)
+		// 注意：不调用 Release()，让锁自然过期或重启后继续持有
+		a.logger.Info("stopped lock renewal, lock will expire naturally if agent doesn't restart")
 	}
 
 	if a.mysql != nil {
@@ -195,7 +313,21 @@ func (a *Agent) Stop() error {
 }
 
 // GetState returns the current node state
+// 在返回状态前，主动检查 MySQL 连接状态，确保返回最新的健康状态
 func (a *Agent) GetState() any {
+	// 主动检查 MySQL 连接状态
+	if err := a.mysql.Ping(); err != nil {
+		a.mu.Lock()
+		a.mysqlConnected = false
+		a.state.IsHealthy = false
+		a.mu.Unlock()
+	} else {
+		a.mu.Lock()
+		a.mysqlConnected = true
+		a.state.IsHealthy = true
+		a.mu.Unlock()
+	}
+
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.state
@@ -334,6 +466,19 @@ func findSubstring(s, substr string) int {
 		}
 	}
 	return -1
+}
+
+// isLeaderMySQLReachable 检查 leader 的 MySQL 是否可达
+// 用于判断原 leader 是否还活着，避免不必要的选举
+func (a *Agent) isLeaderMySQLReachable(host string, port int) bool {
+	// 使用短超时检查 MySQL 端口是否可达
+	addr := fmt.Sprintf("%s:%d", host, port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // configureAsReplica configures this node as a replica of the specified leader
@@ -586,7 +731,94 @@ func (a *Agent) handleAsLeader(ctx context.Context, leaderHost, myHost string) {
 }
 
 // handleAsNonLeader 处理不持有锁的情况
+// 关键逻辑：防止 Agent 重启时触发不必要的选举
+// 1. 如果自己之前是 leader（wasLeader=true），应该优先恢复
+// 2. 如果自己不是原 leader，应该等待原 leader 恢复
+// 3. 只有在原 leader 确实不可用时，才参与选举
 func (a *Agent) handleAsNonLeader(ctx context.Context, leaderNodeID, leaderHost string, leaderPort int, leaderErr error, myHost string) {
+	// 计算启动后经过的时间
+	a.mu.RLock()
+	timeSinceStart := time.Since(a.startTime)
+	wasLeader := a.wasLeader
+	a.mu.RUnlock()
+
+	// 启动保护期：刚启动的 30 秒内，非原 leader 不应该尝试获取锁
+	// 这给原 leader 足够的时间来恢复
+	startupGracePeriod := 30 * time.Second
+
+	// 如果 leader_info 存在且指向其他节点，说明有一个已知的 leader
+	if leaderErr == nil && leaderHost != "" && leaderHost != myHost {
+		a.logger.Debug(fmt.Sprintf("leader_info points to %s, checking if we should wait for leader recovery", leaderHost))
+
+		// 如果我们在启动保护期内，且不是原 leader，等待原 leader 恢复
+		if timeSinceStart < startupGracePeriod && !wasLeader {
+			a.logger.Info(fmt.Sprintf("in startup grace period (%.0fs remaining), waiting for leader %s to recover",
+				(startupGracePeriod - timeSinceStart).Seconds(), leaderHost))
+			// 不尝试获取锁，直接配置为 replica
+			a.ensureReplicaOf(ctx, leaderNodeID, leaderHost, leaderPort)
+			return
+		}
+
+		// 检查原 leader 的 MySQL 是否可达
+		// 如果可达，说明原 leader 可能正在恢复，继续等待
+		if a.isLeaderMySQLReachable(leaderHost, leaderPort) {
+			a.logger.Debug(fmt.Sprintf("leader %s MySQL is reachable, waiting for leader to recover", leaderHost))
+			a.ensureReplicaOf(ctx, leaderNodeID, leaderHost, leaderPort)
+			return
+		}
+
+		a.logger.Info(fmt.Sprintf("leader %s MySQL is not reachable, may attempt failover", leaderHost))
+	}
+
+	// 如果 leader 是我自己（但我没有锁），这通常发生在 agent 重启后
+	// 在这种情况下，我们应该积极尝试恢复 leader 身份
+	if leaderErr == nil && leaderHost == myHost {
+		a.logger.Info("leader_info points to me but I don't hold the lock, attempting to recover leadership")
+
+		// 检查 MySQL 是否健康且是 read-write
+		if err := a.mysql.Ping(); err != nil {
+			a.logger.Warn(fmt.Sprintf("MySQL not healthy, cannot recover as leader: %v", err))
+			return
+		}
+
+		readOnly, _ := a.mysql.IsReadOnly()
+		if readOnly {
+			a.logger.Info("MySQL is read-only, not recovering as leader")
+			return
+		}
+
+		// 尝试获取锁
+		acquired, err := a.lockManager.TryAcquire(ctx)
+		if err != nil {
+			a.logger.Debug(fmt.Sprintf("failed to acquire lock: %v", err))
+			return
+		}
+
+		if acquired {
+			a.logger.Info("recovered leadership lock")
+			a.performFailover(ctx)
+			return
+		}
+
+		// 锁被其他节点持有，等待
+		a.logger.Debug("lock held by another node, waiting for recovery")
+		return
+	}
+
+	// 如果没有 leader 信息，或者原 leader 不可达，尝试获取锁
+	// 但如果在启动保护期内且不是原 leader，仍然等待
+	if timeSinceStart < startupGracePeriod && !wasLeader && leaderErr == nil {
+		a.logger.Info(fmt.Sprintf("in startup grace period, not attempting lock acquisition"))
+		// 至少确保是只读模式
+		if err := a.mysql.SetReadOnly(true); err != nil {
+			a.logger.Error(fmt.Sprintf("failed to set read-only: %v", err))
+		}
+		a.mu.Lock()
+		a.state.Role = RoleReplica
+		a.mu.Unlock()
+		return
+	}
+
 	// 尝试获取锁
 	acquired, err := a.lockManager.TryAcquire(ctx)
 	if err != nil {
@@ -615,19 +847,6 @@ func (a *Agent) handleAsNonLeader(ctx context.Context, leaderNodeID, leaderHost 
 		}
 
 		// 至少确保是只读模式
-		if err := a.mysql.SetReadOnly(true); err != nil {
-			a.logger.Error(fmt.Sprintf("failed to set read-only: %v", err))
-		}
-		a.mu.Lock()
-		a.state.Role = RoleReplica
-		a.mu.Unlock()
-		return
-	}
-
-	// 如果 leader 是我自己（但我没有锁），说明我是旧的 leader，需要降级
-	if leaderHost == myHost {
-		a.logger.Warn("leader_info points to me but I don't hold the lock, I'm a stale leader, setting read-only")
-		// 设置为只读模式，等待新 leader 更新 leader_info
 		if err := a.mysql.SetReadOnly(true); err != nil {
 			a.logger.Error(fmt.Sprintf("failed to set read-only: %v", err))
 		}

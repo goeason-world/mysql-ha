@@ -11,17 +11,19 @@ type SoftwareVersion struct {
 
 // Software download URLs
 var (
-	// etcd versions
+	// etcd versions (MD5 checksums for tar.gz files)
 	EtcdVersions = []SoftwareVersion{
 		{
 			Name:        "etcd",
 			Version:     "3.5.13",
 			DownloadURL: "https://github.com/etcd-io/etcd/releases/download/v3.5.13/etcd-v3.5.13-linux-amd64.tar.gz",
+			Checksum:    "c94a9c0e1e8c6c2c0e0e0e0e0e0e0e0e", // 占位符，实际部署时会跳过校验
 		},
 		{
 			Name:        "etcd",
 			Version:     "3.5.12",
 			DownloadURL: "https://github.com/etcd-io/etcd/releases/download/v3.5.12/etcd-v3.5.12-linux-amd64.tar.gz",
+			Checksum:    "",
 		},
 	}
 
@@ -31,6 +33,7 @@ var (
 			Name:        "mysql",
 			Version:     "5.7.44",
 			DownloadURL: "https://dev.mysql.com/get/Downloads/MySQL-5.7/mysql-5.7.44-linux-glibc2.12-x86_64.tar.gz",
+			Checksum:    "",
 		},
 	}
 
@@ -40,11 +43,13 @@ var (
 			Name:        "mysql",
 			Version:     "8.0.36",
 			DownloadURL: "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.36-linux-glibc2.17-x86_64.tar.xz",
+			Checksum:    "",
 		},
 		{
 			Name:        "mysql",
 			Version:     "8.0.35",
 			DownloadURL: "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.35-linux-glibc2.17-x86_64.tar.xz",
+			Checksum:    "",
 		},
 	}
 )
@@ -102,7 +107,8 @@ type ClusterConfig struct {
 	InstallPath  string           `json:"install_path"`
 	DataPath     string           `json:"data_path"`
 	Settings     *ClusterSettings `json:"settings"`
-	Phase        string           `json:"phase"` // 安装阶段: phase1_etcd, phase2_mysql, phase3_replication, phase4_agent, phase5_verify, completed, failed_*
+	Phase        string           `json:"phase"`         // 安装阶段: phase1_etcd, phase2_mysql, phase3_replication, phase4_agent, phase5_verify, completed, failed_*
+	AgentVersion string           `json:"agent_version"` // HA Agent 版本号
 }
 
 // ClusterSettings holds cluster-specific settings

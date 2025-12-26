@@ -14,6 +14,7 @@ type Config struct {
 	Namespace     string      `yaml:"namespace"`
 	Scope         string      `yaml:"scope"`
 	AdvertiseHost string      `yaml:"advertise_host"` // External IP for other nodes to connect
+	Version       string      `yaml:"version"`        // Agent version injected by webadmin
 	DCS           DCSConfig   `yaml:"dcs"`
 	MySQL         MySQLConfig `yaml:"mysql"`
 	API           APIConfig   `yaml:"api"`

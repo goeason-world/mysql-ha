@@ -2,6 +2,10 @@ package installer
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,14 +16,138 @@ import (
 type Installer struct {
 	taskChan chan *InstallTask
 	tasks    map[string]*InstallTask
+	cacheDir string // 本地缓存目录
 }
 
 // NewInstaller creates a new Installer
 func NewInstaller() *Installer {
+	cacheDir := "./cache"
+	os.MkdirAll(cacheDir, 0755)
+
 	return &Installer{
 		taskChan: make(chan *InstallTask, 100),
 		tasks:    make(map[string]*InstallTask),
+		cacheDir: cacheDir,
 	}
+}
+
+// DownloadToLocal 下载文件到本地缓存
+func (i *Installer) DownloadToLocal(downloadURL, filename string, progress func(int, string)) (string, error) {
+	localPath := filepath.Join(i.cacheDir, filename)
+
+	// 检查本地缓存是否已存在且完整
+	if _, err := os.Stat(localPath); err == nil {
+		// 文件存在，验证完整性
+		progress(10, fmt.Sprintf("Found cached file: %s, verifying...", filename))
+
+		// 简单验证：检查文件大小是否大于 1MB（避免下载中断的文件）
+		info, _ := os.Stat(localPath)
+		if info.Size() > 1024*1024 {
+			progress(15, "Using cached file")
+			return localPath, nil
+		}
+		progress(12, "Cached file is incomplete, re-downloading...")
+		os.Remove(localPath)
+	}
+
+	progress(10, fmt.Sprintf("Downloading %s to local cache from %s...", filename, downloadURL))
+
+	// 创建临时文件
+	tmpPath := localPath + ".tmp"
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer out.Close()
+
+	// 下载文件 - 不设置总超时，让连接自己管理
+	client := &http.Client{
+		Timeout: 0, // 不设置总超时
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second, // 等待响应头的超时
+		},
+	}
+
+	progress(11, "Connecting to download server...")
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("download failed with status: %d", resp.StatusCode)
+	}
+
+	// 获取文件大小
+	totalSize := resp.ContentLength
+	progress(12, fmt.Sprintf("Starting download, size: %d MB", totalSize/1024/1024))
+
+	// 带进度的复制
+	var downloaded int64
+	buf := make([]byte, 32*1024) // 32KB buffer
+	lastProgress := 0
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			_, writeErr := out.Write(buf[:n])
+			if writeErr != nil {
+				os.Remove(tmpPath)
+				return "", fmt.Errorf("failed to write file: %w", writeErr)
+			}
+			downloaded += int64(n)
+
+			// 计算进度 (12-19 之间)
+			if totalSize > 0 {
+				pct := int(float64(downloaded)/float64(totalSize)*7) + 12 // 12-19
+				if pct > lastProgress {
+					lastProgress = pct
+					progress(pct, fmt.Sprintf("Downloading... %d/%d MB (%d%%)",
+						downloaded/1024/1024, totalSize/1024/1024,
+						int(float64(downloaded)/float64(totalSize)*100)))
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("failed to download: %w", err)
+		}
+	}
+
+	// 重命名为最终文件
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to rename file: %w", err)
+	}
+
+	progress(20, fmt.Sprintf("Downloaded %s to local cache (%d MB)", filename, downloaded/1024/1024))
+	return localPath, nil
+}
+
+// UploadToHost 上传本地文件到远程主机
+func (i *Installer) UploadToHost(host *Host, localPath, remotePath string, progress func(int, string)) error {
+	client, err := NewSSHClient(host)
+	if err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+	defer client.Close()
+
+	// 先杀掉可能存在的 wget 进程
+	client.RunWithSudo("pkill -f 'wget.*tar' 2>/dev/null || true")
+
+	progress(25, fmt.Sprintf("Uploading to %s...", host.Name))
+
+	if err := client.UploadFile(localPath, remotePath); err != nil {
+		return fmt.Errorf("failed to upload: %w", err)
+	}
+
+	progress(35, "Upload completed")
+	return nil
 }
 
 // CheckEtcdInstalled checks if etcd is already installed
@@ -60,7 +188,8 @@ func (i *Installer) CheckMySQLInstalled(host *Host, installPath string) (bool, e
 }
 
 // InstallEtcd installs etcd on a remote host
-func (i *Installer) InstallEtcd(host *Host, version, installPath string, etcdNodes []Host, progress func(int, string)) error {
+// localCachePath: 本地缓存的文件路径（如果已下载）
+func (i *Installer) InstallEtcd(host *Host, version, installPath string, etcdNodes []Host, localCachePath string, progress func(int, string)) error {
 	client, err := NewSSHClient(host)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
@@ -92,24 +221,42 @@ func (i *Installer) InstallEtcd(host *Host, version, installPath string, etcdNod
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	progress(20, "Downloading etcd...")
-	// 清理旧文件并下载
-	cleanCmd := "rm -f /tmp/etcd.tar.gz /tmp/etcd-v*-linux-amd64 2>/dev/null || true"
-	client.Run(cleanCmd)
+	tmpFile := "/tmp/etcd.tar.gz"
 
-	downloadCmd := fmt.Sprintf("wget -q --timeout=300 '%s' -O /tmp/etcd.tar.gz", downloadURL)
-	if _, err := client.Run(downloadCmd); err != nil {
-		return fmt.Errorf("failed to download etcd: %w", err)
-	}
+	// 检查远程是否已有完整文件
+	progress(15, "Checking remote file...")
+	checkCmd := fmt.Sprintf("tar -tzf %s >/dev/null 2>&1 && echo ok || echo no", tmpFile)
+	output, _ := client.Run(checkCmd)
+	if strings.TrimSpace(output) == "ok" {
+		progress(30, "Remote file exists and is valid, skipping upload...")
+	} else {
+		// 如果有本地缓存，上传到远程
+		if localCachePath != "" {
+			progress(20, fmt.Sprintf("Uploading etcd to %s...", host.Name))
+			// 先杀掉可能存在的 wget 进程
+			client.RunWithSudo("pkill -f 'wget.*etcd' 2>/dev/null || true")
+			client.Run(fmt.Sprintf("rm -f %s", tmpFile))
 
-	// 验证下载文件
-	checkCmd := "test -f /tmp/etcd.tar.gz && ls -la /tmp/etcd.tar.gz"
-	if _, err := client.Run(checkCmd); err != nil {
-		return fmt.Errorf("etcd download file not found: %w", err)
+			if err := client.UploadFile(localCachePath, tmpFile); err != nil {
+				return fmt.Errorf("failed to upload etcd: %w", err)
+			}
+			progress(30, "Upload completed")
+		} else {
+			// 没有本地缓存，从网络下载
+			progress(20, "Downloading etcd from internet...")
+			client.RunWithSudo("pkill -f 'wget.*etcd' 2>/dev/null || true")
+			client.Run(fmt.Sprintf("rm -f %s", tmpFile))
+
+			downloadCmd := fmt.Sprintf("wget -q --timeout=300 '%s' -O %s", downloadURL, tmpFile)
+			if _, err := client.Run(downloadCmd); err != nil {
+				return fmt.Errorf("failed to download etcd: %w", err)
+			}
+			progress(30, "Download completed")
+		}
 	}
 
 	progress(50, "Extracting etcd...")
-	extractCmd := fmt.Sprintf("tar -xzf /tmp/etcd.tar.gz -C /tmp && sudo mv /tmp/etcd-v%s-linux-amd64/* %s/etcd/", version, installPath)
+	extractCmd := fmt.Sprintf("rm -rf /tmp/etcd-v*-linux-amd64 && tar -xzf %s -C /tmp && sudo mv /tmp/etcd-v%s-linux-amd64/* %s/etcd/", tmpFile, version, installPath)
 	if _, err := client.RunWithSudo(extractCmd); err != nil {
 		return fmt.Errorf("failed to extract etcd: %w", err)
 	}
@@ -122,7 +269,6 @@ func (i *Installer) InstallEtcd(host *Host, version, installPath string, etcdNod
 
 	progress(80, "Creating systemd service...")
 	serviceContent := generateEtcdService(host.Name, host.IP, installPath, etcdNodes)
-	// 使用 cat 和 heredoc 写入文件，避免特殊字符问题
 	serviceCmd := fmt.Sprintf("cat > /etc/systemd/system/etcd.service << 'ETCD_SERVICE_EOF'\n%s\nETCD_SERVICE_EOF", serviceContent)
 	if _, err := client.RunWithSudo(serviceCmd); err != nil {
 		return fmt.Errorf("failed to create service: %w", err)
@@ -138,7 +284,8 @@ func (i *Installer) InstallEtcd(host *Host, version, installPath string, etcdNod
 }
 
 // InstallMySQL installs MySQL on a remote host
-func (i *Installer) InstallMySQL(host *Host, version, installPath, dataPath string, settings *ClusterSettings, progress func(int, string)) error {
+// localCachePath: 本地缓存的文件路径（如果已下载）
+func (i *Installer) InstallMySQL(host *Host, version, installPath, dataPath string, settings *ClusterSettings, localCachePath string, progress func(int, string)) error {
 	client, err := NewSSHClient(host)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
@@ -167,8 +314,76 @@ func (i *Installer) InstallMySQL(host *Host, version, installPath, dataPath stri
 	}
 
 	progress(5, "Installing dependencies...")
-	if _, err := client.RunWithSudo("apt-get update && apt-get install -y libaio1 libnuma1 libncurses5 || yum install -y libaio numactl ncurses-compat-libs"); err != nil {
-		// Ignore error, might be different package manager
+	// 尝试安装依赖，根据不同的包管理器
+	checkPkgMgrCmd := "if command -v apt-get >/dev/null 2>&1; then echo apt; elif command -v yum >/dev/null 2>&1; then echo yum; elif command -v dnf >/dev/null 2>&1; then echo dnf; else echo unknown; fi"
+	pkgMgr, _ := client.Run(checkPkgMgrCmd)
+	pkgMgr = strings.TrimSpace(pkgMgr)
+
+	if pkgMgr == "apt" {
+		client.RunWithSudo("apt-get update && apt-get install -y libaio1 libnuma1 libncurses5 libtinfo5 sshpass || true")
+	} else if pkgMgr == "yum" || pkgMgr == "dnf" {
+		// CentOS/RHEL 8+ 使用 ncurses-compat-libs，CentOS 7 使用 ncurses-libs
+		client.RunWithSudo("yum install -y libaio numactl ncurses-compat-libs sshpass || yum install -y libaio numactl ncurses-libs sshpass || true")
+		// 尝试安装 ncurses-compat-libs（某些系统可能需要启用 PowerTools/CRB 仓库）
+		client.RunWithSudo("dnf install -y ncurses-compat-libs sshpass 2>/dev/null || true")
+	}
+
+	// 强制创建 libncurses.so.5 和 libtinfo.so.5 软链接（MySQL 5.7 需要）
+	progress(7, "Ensuring libncurses.so.5 symlinks exist...")
+
+	// 使用一个综合脚本来处理所有情况
+	symlinkScript := `
+# 确定库目录
+if [ -d /usr/lib64 ]; then
+    LIBDIR=/usr/lib64
+else
+    LIBDIR=/usr/lib
+fi
+
+# 检查 libncurses.so.5 是否存在
+if [ ! -f $LIBDIR/libncurses.so.5 ] && [ ! -L $LIBDIR/libncurses.so.5 ]; then
+    # 查找 libncurses.so.6 或 libncursesw.so.6
+    NCURSES_LIB=$(ls $LIBDIR/libncurses.so.6* 2>/dev/null | head -1)
+    if [ -z "$NCURSES_LIB" ]; then
+        NCURSES_LIB=$(ls $LIBDIR/libncursesw.so.6* 2>/dev/null | head -1)
+    fi
+    if [ -z "$NCURSES_LIB" ]; then
+        NCURSES_LIB=$(ls /lib64/libncurses.so.6* 2>/dev/null | head -1)
+    fi
+    if [ -n "$NCURSES_LIB" ]; then
+        ln -sf "$NCURSES_LIB" $LIBDIR/libncurses.so.5
+        echo "Created symlink: $LIBDIR/libncurses.so.5 -> $NCURSES_LIB"
+    fi
+fi
+
+# 检查 libtinfo.so.5 是否存在
+if [ ! -f $LIBDIR/libtinfo.so.5 ] && [ ! -L $LIBDIR/libtinfo.so.5 ]; then
+    # 查找 libtinfo.so.6
+    TINFO_LIB=$(ls $LIBDIR/libtinfo.so.6* 2>/dev/null | head -1)
+    if [ -z "$TINFO_LIB" ]; then
+        TINFO_LIB=$(ls /lib64/libtinfo.so.6* 2>/dev/null | head -1)
+    fi
+    # 如果没有 libtinfo，尝试用 libncurses 代替
+    if [ -z "$TINFO_LIB" ]; then
+        TINFO_LIB=$(ls $LIBDIR/libncurses.so.6* 2>/dev/null | head -1)
+    fi
+    if [ -n "$TINFO_LIB" ]; then
+        ln -sf "$TINFO_LIB" $LIBDIR/libtinfo.so.5
+        echo "Created symlink: $LIBDIR/libtinfo.so.5 -> $TINFO_LIB"
+    fi
+fi
+
+# 刷新动态链接库缓存
+ldconfig 2>/dev/null || true
+
+# 验证
+ls -la $LIBDIR/libncurses.so.5 $LIBDIR/libtinfo.so.5 2>/dev/null || echo "Warning: some symlinks may be missing"
+`
+	output, err := client.RunWithSudo(fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(symlinkScript, "'", "'\\''")))
+	if err != nil {
+		progress(7, fmt.Sprintf("Warning: symlink creation may have failed: %v", err))
+	} else {
+		progress(8, fmt.Sprintf("Symlink check: %s", strings.TrimSpace(output)))
 	}
 
 	progress(10, "Creating MySQL user and directories...")
@@ -183,32 +398,59 @@ func (i *Installer) InstallMySQL(host *Host, version, installPath, dataPath stri
 		client.RunWithSudo(cmd)
 	}
 
-	progress(20, "Downloading MySQL...")
+	progress(15, "Preparing MySQL package...")
 	ext := "tar.gz"
 	if strings.Contains(downloadURL, ".tar.xz") {
 		ext = "tar.xz"
 	}
-	// 清理旧文件
-	cleanCmd := fmt.Sprintf("rm -f /tmp/mysql.%s /tmp/mysql-*-linux-* 2>/dev/null || true", ext)
-	client.Run(cleanCmd)
 
-	downloadCmd := fmt.Sprintf("wget -q --timeout=600 '%s' -O /tmp/mysql.%s", downloadURL, ext)
-	if _, err := client.Run(downloadCmd); err != nil {
-		return fmt.Errorf("failed to download MySQL: %w", err)
+	tmpFile := fmt.Sprintf("/tmp/mysql.%s", ext)
+
+	// 检查远程是否已有完整文件
+	var testCmd string
+	if ext == "tar.xz" {
+		testCmd = fmt.Sprintf("xz -t %s 2>/dev/null && echo ok || echo no", tmpFile)
+	} else {
+		testCmd = fmt.Sprintf("tar -tzf %s >/dev/null 2>&1 && echo ok || echo no", tmpFile)
 	}
+	output, _ = client.Run(testCmd)
+	if strings.TrimSpace(output) == "ok" {
+		progress(30, "Remote file exists and is valid, skipping upload...")
+	} else {
+		// 如果有本地缓存，上传到远程
+		if localCachePath != "" {
+			progress(20, fmt.Sprintf("Uploading MySQL to %s...", host.Name))
+			// 先杀掉可能存在的 wget 进程
+			client.RunWithSudo("pkill -f 'wget.*mysql' 2>/dev/null || true")
+			client.Run(fmt.Sprintf("rm -f %s", tmpFile))
 
-	// 验证下载文件
-	checkCmd := fmt.Sprintf("test -f /tmp/mysql.%s && ls -la /tmp/mysql.%s", ext, ext)
-	if _, err := client.Run(checkCmd); err != nil {
-		return fmt.Errorf("MySQL download file not found: %w", err)
+			if err := client.UploadFile(localCachePath, tmpFile); err != nil {
+				return fmt.Errorf("failed to upload MySQL: %w", err)
+			}
+			progress(30, "Upload completed")
+		} else {
+			// 没有本地缓存，从网络下载
+			progress(20, "Downloading MySQL from internet...")
+			client.RunWithSudo("pkill -f 'wget.*mysql' 2>/dev/null || true")
+			client.Run(fmt.Sprintf("rm -f %s", tmpFile))
+
+			downloadCmd := fmt.Sprintf("wget -q --timeout=600 '%s' -O %s", downloadURL, tmpFile)
+			if _, err := client.Run(downloadCmd); err != nil {
+				return fmt.Errorf("failed to download MySQL: %w", err)
+			}
+			progress(30, "Download completed")
+		}
 	}
 
 	progress(40, "Extracting MySQL...")
+	// 先清理旧的解压目录
+	client.Run("rm -rf /tmp/mysql-*-linux-* 2>/dev/null || true")
+
 	var extractCmd string
 	if ext == "tar.xz" {
-		extractCmd = fmt.Sprintf("tar -xJf /tmp/mysql.%s -C /tmp", ext)
+		extractCmd = fmt.Sprintf("tar -xJf %s -C /tmp", tmpFile)
 	} else {
-		extractCmd = fmt.Sprintf("tar -xzf /tmp/mysql.%s -C /tmp", ext)
+		extractCmd = fmt.Sprintf("tar -xzf %s -C /tmp", tmpFile)
 	}
 	if _, err := client.Run(extractCmd); err != nil {
 		return fmt.Errorf("failed to extract MySQL: %w", err)
@@ -292,8 +534,8 @@ func (i *Installer) InstallMySQL(host *Host, version, installPath, dataPath stri
 	var mysqlReady bool
 	for retry := 0; retry < 12; retry++ {
 		time.Sleep(5 * time.Second)
-		checkCmd = fmt.Sprintf("%s/mysql/bin/mysqladmin -u root ping 2>/dev/null", installPath)
-		if _, err = client.Run(checkCmd); err == nil {
+		pingCmd := fmt.Sprintf("%s/mysql/bin/mysqladmin -u root ping 2>/dev/null", installPath)
+		if _, err = client.Run(pingCmd); err == nil {
 			mysqlReady = true
 			break
 		}
@@ -534,10 +776,17 @@ func generateAgentConfig(host *Host, config *ClusterConfig) string {
 		}
 	}
 
+	// 使用集群配置中的版本号，如果没有则使用默认值
+	agentVersion := config.AgentVersion
+	if agentVersion == "" {
+		agentVersion = "1.0.0"
+	}
+
 	return fmt.Sprintf(`name: %s
 namespace: mypatroni
 scope: %s
 advertise_host: "%s"
+version: "%s"
 
 dcs:
   endpoints:
@@ -569,6 +818,7 @@ ha:
 		host.Name,
 		config.Name,
 		host.IP, // Add advertise_host with the node's external IP
+		agentVersion,
 		formatEndpoints(etcdEndpoints),
 		config.Settings.MySQLPort,
 		config.Settings.RootPassword,
@@ -706,6 +956,67 @@ func (i *Installer) UploadAndStartHAAgent(host *Host, installPath, agentBinaryPa
 	}
 
 	progress(100, "HA Agent started successfully")
+	return nil
+}
+
+// UploadAndStartHAAgentWithConfig uploads the HA agent binary, updates config, and starts the service
+func (i *Installer) UploadAndStartHAAgentWithConfig(host *Host, installPath, agentBinaryPath string, config *ClusterConfig, progress func(int, string)) error {
+	client, err := NewSSHClient(host)
+	if err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+	defer client.Close()
+
+	// 先停止已运行的服务，避免 "Text file busy" 错误
+	progress(60, "Stopping existing HA Agent service if running...")
+	client.RunWithSudo("systemctl stop mypatroni 2>/dev/null || true")
+	// 等待进程完全退出
+	time.Sleep(2 * time.Second)
+	// 确保进程已停止
+	client.RunWithSudo("pkill -9 mypatroni 2>/dev/null || true")
+	time.Sleep(1 * time.Second)
+
+	progress(65, "Updating HA Agent configuration...")
+	// 更新配置文件（包含新版本号）
+	agentConfig := generateAgentConfig(host, config)
+	configCmd := fmt.Sprintf("cat > /etc/mypatroni/config.yaml << 'AGENT_CONFIG_EOF'\n%s\nAGENT_CONFIG_EOF", agentConfig)
+	if _, err := client.RunWithSudo(configCmd); err != nil {
+		return fmt.Errorf("failed to update config: %w", err)
+	}
+
+	progress(70, "Uploading HA Agent binary...")
+	// 先删除旧文件
+	client.RunWithSudo(fmt.Sprintf("rm -f %s/mypatroni/mypatroni 2>/dev/null || true", installPath))
+
+	if err := client.UploadFile(agentBinaryPath, fmt.Sprintf("%s/mypatroni/mypatroni", installPath)); err != nil {
+		return fmt.Errorf("failed to upload agent binary: %w", err)
+	}
+
+	if _, err := client.RunWithSudo(fmt.Sprintf("chmod +x %s/mypatroni/mypatroni", installPath)); err != nil {
+		return fmt.Errorf("failed to set execute permission: %w", err)
+	}
+
+	progress(85, "Starting HA Agent service...")
+	if _, err := client.RunWithSudo("systemctl daemon-reload"); err != nil {
+		return fmt.Errorf("failed to reload systemd: %w", err)
+	}
+
+	if _, err := client.RunWithSudo("systemctl enable mypatroni"); err != nil {
+		return fmt.Errorf("failed to enable mypatroni: %w", err)
+	}
+
+	if _, err := client.RunWithSudo("systemctl start mypatroni"); err != nil {
+		return fmt.Errorf("failed to start mypatroni: %w", err)
+	}
+
+	time.Sleep(3 * time.Second)
+
+	if _, err := client.Run("systemctl is-active mypatroni"); err != nil {
+		status, _ := client.RunWithSudo("systemctl status mypatroni --no-pager -l")
+		return fmt.Errorf("mypatroni service not running: %s", status)
+	}
+
+	progress(100, "HA Agent upgraded successfully (version: "+config.AgentVersion+")")
 	return nil
 }
 

@@ -79,12 +79,17 @@ func (e *EtcdDCS) Connect(ctx context.Context) error {
 }
 
 // Close closes the etcd connection
+// graceful 参数控制是否优雅关闭（不释放锁）
 func (e *EtcdDCS) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// 优雅关闭时不关闭 session，让锁自然过期
+	// 这样 Agent 重启后可以重新获取锁，避免不必要的选举
+	// session 会在 TTL 后自动过期
 	if e.session != nil {
-		e.session.Close()
+		// 不调用 session.Close()，让锁自然过期
+		e.session = nil
 	}
 	if e.client != nil {
 		e.connected = false

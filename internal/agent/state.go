@@ -22,6 +22,7 @@ type NodeState struct {
 	NodeID          string           `json:"node_id"`
 	Hostname        string           `json:"hostname"`
 	Role            NodeRole         `json:"role"`
+	AgentVersion    string           `json:"agent_version"`
 	MySQLVersion    string           `json:"mysql_version"`
 	GTIDExecuted    string           `json:"gtid_executed"`
 	ReplicationLag  int64            `json:"replication_lag"`

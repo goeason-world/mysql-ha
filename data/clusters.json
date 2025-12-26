@@ -1,15 +1,15 @@
 {
-  "6a80f24b-c7c4-42cb-9e39-d34e84d1d4d0": {
-    "id": "6a80f24b-c7c4-42cb-9e39-d34e84d1d4d0",
+  "f88db10d-5e60-42c9-a445-24b967280f45": {
+    "id": "f88db10d-5e60-42c9-a445-24b967280f45",
     "name": "mysql-cluster",
     "hosts": [
       {
-        "id": "12ad1a3e-7253-49d1-b646-1e8b69d5c73f",
+        "id": "d69feded-6eb5-4c57-883f-f3b6daef6c68",
         "name": "mysql-node-1",
         "ip": "10.211.55.32",
         "port": 22,
         "username": "mngdb",
-        "password": "wuhua@2013",
+        "password": "mngdb",
         "roles": [
           "etcd",
           "slave"
@@ -17,28 +17,28 @@
         "status": "completed"
       },
       {
-        "id": "41e3a343-c5c2-40b5-9f51-d4e301aa9bd4",
+        "id": "eab5b486-1c38-425b-b8cd-9dee0ea7e476",
         "name": "mysql-node-2",
         "ip": "10.211.55.33",
         "port": 22,
         "username": "mngdb",
-        "password": "wuhua@2013",
+        "password": "mngdb",
         "roles": [
           "etcd",
-          "slave"
+          "master"
         ],
         "status": "completed"
       },
       {
-        "id": "1b677699-c0f1-47cf-b7a8-f95a5cf8c014",
+        "id": "3b0daccb-55f5-4a59-9539-f5487a2cc75e",
         "name": "mysql-node-3",
         "ip": "10.211.55.34",
         "port": 22,
         "username": "mngdb",
-        "password": "wuhua@2013",
+        "password": "mngdb",
         "roles": [
           "etcd",
-          "master"
+          "slave"
         ],
         "status": "completed"
       }
@@ -46,7 +46,7 @@
     "etcd_version": "3.5.13",
     "mysql_version": "5.7.44",
     "install_path": "/opt/mysql-ha",
-    "data_path": "/var/lib/mysql",
+    "data_path": "/data/mysqldata",
     "settings": {
       "mysql_port": 3306,
       "etcd_client_port": 0,
@@ -56,6 +56,7 @@
       "root_password": "Root@123456",
       "ha_agent_port": 8080
     },
-    "phase": "completed"
+    "phase": "completed",
+    "agent_version": "1.0.3"
   }
 }

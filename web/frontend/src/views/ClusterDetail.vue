@@ -220,6 +220,9 @@
                   <el-tag :type="row.is_healthy ? 'success' : 'danger'">{{ row.is_healthy ? '运行中' : '离线' }}</el-tag>
                 </template>
               </el-table-column>
+              <el-table-column label="版本">
+                <template #default="{ row }">{{ row.agent_version || '-' }}</template>
+              </el-table-column>
               <el-table-column label="API 端口">
                 <template #default>{{ cluster.settings?.ha_agent_port || 8080 }}</template>
               </el-table-column>
@@ -275,9 +278,14 @@
         <div v-show="activeMenu === 'install'" class="content-section">
           <div class="section-header">
             <h2 class="section-title">📦 安装状态</h2>
-            <el-button @click="refreshInstallStatus" :loading="refreshingInstall" type="primary">
-              <el-icon><Refresh /></el-icon> 刷新状态
-            </el-button>
+            <div>
+              <el-button @click="refreshInstallStatus" :loading="refreshingInstall" type="primary">
+                <el-icon><Refresh /></el-icon> 刷新状态
+              </el-button>
+              <el-button @click="showRetryDialog" type="warning" style="margin-left: 10px;" :disabled="!hasFailedNodes">
+                <el-icon><RefreshRight /></el-icon> 重试安装
+              </el-button>
+            </div>
           </div>
           <el-card class="control-card">
             <template #header>
@@ -297,11 +305,50 @@
               <el-table-column label="安装状态">
                 <template #default="{ row }"><el-tag :type="getStatusType(row.status)">{{ row.status || 'pending' }}</el-tag></template>
               </el-table-column>
+              <el-table-column label="操作" width="120">
+                <template #default="{ row }">
+                  <el-button size="small" type="warning" v-if="row.status !== 'completed'" @click="retryNodeInstall(row)">重试</el-button>
+                </template>
+              </el-table-column>
             </el-table>
           </el-card>
         </div>
       </template>
     </div>
+
+    <!-- 重试安装对话框 -->
+    <el-dialog v-model="retryDialogVisible" title="重试安装" width="550px">
+      <el-alert type="info" :closable="false" style="margin-bottom: 20px;">
+        <p>选择要重试安装的节点和阶段：</p>
+        <ul style="margin: 10px 0; padding-left: 20px;">
+          <li>如果下载文件已存在且完整，将跳过下载直接解压</li>
+          <li>已完成的节点不会被重复安装</li>
+        </ul>
+      </el-alert>
+      <el-form label-width="100px">
+        <el-form-item label="选择节点">
+          <el-checkbox-group v-model="retryTargets">
+            <el-checkbox v-for="host in failedHosts" :key="host.id" :label="host.id">
+              {{ host.name }} ({{ host.ip }}) - {{ host.status || 'pending' }}
+            </el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="重试阶段">
+          <el-select v-model="retryPhase" placeholder="自动检测">
+            <el-option label="自动检测" value="" />
+            <el-option label="etcd" value="etcd" />
+            <el-option label="MySQL" value="mysql" />
+            <el-option label="HA Agent" value="agent" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="retryDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="performRetryInstall" :loading="retryLoading" :disabled="retryTargets.length === 0">
+          开始重试 ({{ retryTargets.length }} 个节点)
+        </el-button>
+      </template>
+    </el-dialog>
 
     <!-- Switchover 确认对话框 -->
     <el-dialog v-model="switchoverDialogVisible" title="主从切换确认" width="500px">
@@ -389,11 +436,11 @@ import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
-  Loading, House, Coin, Connection, Download, Back, Refresh,
+  Loading, House, Coin, Connection, Download, Back, Refresh, RefreshRight,
   DataBoard, CircleCheck, Monitor, Document, Upload, WarnTriangleFilled
 } from '@element-plus/icons-vue'
 import {
-  getCluster, getInstallStatus, getClusterStatus, switchover, upgradeAgents, getAgentLogs, repairReplication,
+  getCluster, getInstallStatus, getClusterStatus, switchover, upgradeAgents, restartAgents, getAgentLogs, repairReplication, retryInstall,
   type Cluster, type ClusterStatus, type NodeStatus
 } from '@/api'
 
@@ -428,6 +475,12 @@ const repairLoading = ref(false)
 const repairNodeDialogVisible = ref(false)
 const repairNodeLoading = ref(false)
 const selectedRepairNode = ref<NodeStatus | null>(null)
+
+// 重试安装相关
+const retryDialogVisible = ref(false)
+const retryLoading = ref(false)
+const retryTargets = ref<string[]>([])
+const retryPhase = ref('')
 
 // 日志相关
 const logs = ref<Array<{ time: string; level: string; node?: string; message: string }>>([])
@@ -472,6 +525,18 @@ const agentNodes = computed(() => {
 const agentHealthyCount = computed(() => {
   if (!clusterStatus.value) return 0
   return clusterStatus.value.nodes.filter(n => n.is_healthy).length
+})
+
+// 检查是否有失败的节点
+const hasFailedNodes = computed(() => {
+  if (!cluster.value) return false
+  return cluster.value.hosts.some(h => h.status !== 'completed')
+})
+
+// 获取失败的节点列表
+const failedHosts = computed(() => {
+  if (!cluster.value) return []
+  return cluster.value.hosts.filter(h => h.status !== 'completed')
 })
 
 // 方法
@@ -569,7 +634,7 @@ const performBatchUpgrade = async () => {
 const restartAgent = async (node: NodeStatus) => {
   if (!cluster.value) return
   try {
-    await upgradeAgents(cluster.value.id, [node.node_id])
+    await restartAgents(cluster.value.id, [node.node_id])
     ElMessage.success(`正在重启 ${node.name} 的 Agent`)
     addLog('INFO', `重启 Agent: ${node.name}`)
   } catch (error: any) {
@@ -637,6 +702,40 @@ const confirmRepairNode = async () => {
     ElMessage.error(error.message || '修复失败')
   }
   repairNodeLoading.value = false
+}
+
+// 重试安装相关
+const showRetryDialog = () => {
+  retryTargets.value = failedHosts.value.map(h => h.id || '')
+  retryPhase.value = ''
+  retryDialogVisible.value = true
+}
+
+const retryNodeInstall = async (host: any) => {
+  if (!cluster.value) return
+  try {
+    await retryInstall(cluster.value.id, [host.id])
+    ElMessage.success(`正在重试安装节点 ${host.name}`)
+    addLog('INFO', `重试安装节点: ${host.name}`)
+    setTimeout(() => refreshInstallStatus(), 5000)
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.error || '重试失败')
+  }
+}
+
+const performRetryInstall = async () => {
+  if (!cluster.value || retryTargets.value.length === 0) return
+  retryLoading.value = true
+  try {
+    await retryInstall(cluster.value.id, retryTargets.value, retryPhase.value || undefined)
+    ElMessage.success('重试安装已开始')
+    retryDialogVisible.value = false
+    addLog('INFO', `开始重试安装 ${retryTargets.value.length} 个节点`)
+    setTimeout(() => refreshInstallStatus(), 5000)
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.error || '重试失败')
+  }
+  retryLoading.value = false
 }
 
 // 日志相关
