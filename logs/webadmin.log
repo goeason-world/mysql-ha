@@ -10132,3 +10132,51 @@ Dec 26 00:02:53 node1 systemd[1]: mypatroni.service: Failed with result 'exit-co
 2025/12/27 12:13:00 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
 2025/12/27 12:13:00 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
 2025/12/27 12:13:00 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:13:15 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:13:15 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:13:15 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:15 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:15 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:15 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:13:30 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:13:30 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:13:30 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:30 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:30 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:30 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:13:46 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:13:46 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:13:46 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:46 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:46 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:13:46 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:14:01 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:14:01 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:14:01 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:01 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:01 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:01 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:14:16 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:14:16 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:14:16 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:16 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:16 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:16 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:14:31 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:14:31 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:14:31 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:31 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:31 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:14:31 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:15:23 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:15:23 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:15:23 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:15:23 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:15:23 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:15:23 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
+2025/12/27 12:16:23 [INFO] 从 etcd 获取 leader_info: key=/mypatroni/mysql-cluster/leader_info, value={"node_id":"mysql-node-2","host":"10.211.55.33","port":3306,"timestamp":1766679394}
+2025/12/27 12:16:23 [INFO] 解析 etcd leader: node_id=mysql-node-2, host=10.211.55.33
+2025/12/27 12:16:23 [DEBUG] Agent mysql-node-1 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:16:23 [DEBUG] Agent mysql-node-2 报告: role=leader, mysql_healthy=true, version=1.0.9
+2025/12/27 12:16:23 [DEBUG] Agent mysql-node-3 报告: role=replica, mysql_healthy=true, version=1.0.9
+2025/12/27 12:16:23 [INFO] 最终 leader (来自 agent 报告): mysql-node-2 (10.211.55.33)
