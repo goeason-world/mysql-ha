@@ -21,19 +21,20 @@ const DefaultVersion = "1.0.0"
 
 // Agent is the core HA agent running on each MySQL node
 type Agent struct {
-	config         *config.Config
-	dcs            dcs.DCS
-	mysql          *mysql.Manager
-	lockManager    *election.LockManager
-	logger         *log.Logger
-	state          *NodeState
-	stopCh         chan struct{}
-	mu             sync.RWMutex
-	mysqlConnected bool
-	dcsConnected   bool
-	lastLeaderHost string    // 缓存上次的 leader host，用于检测 leader 变更
-	startTime      time.Time // Agent 启动时间，用于判断是否刚启动
-	wasLeader      bool      // 标记自己之前是否是 leader（通过 leader_info 判断）
+	config          *config.Config
+	dcs             dcs.DCS
+	mysql           *mysql.Manager
+	lockManager     *election.LockManager
+	logger          *log.Logger
+	state           *NodeState
+	stopCh          chan struct{}
+	mu              sync.RWMutex
+	mysqlConnected  bool
+	dcsConnected    bool
+	lastLeaderHost  string    // 缓存上次的 leader host，用于检测 leader 变更
+	startTime       time.Time // Agent 启动时间，用于判断是否刚启动
+	wasLeader       bool      // 标记自己之前是否是 leader（通过 leader_info 判断）
+	mysqlRecovering bool      // 标记是否正在进行 MySQL 自动恢复
 }
 
 // getVersion returns the agent version from config or default
@@ -229,11 +230,31 @@ func (a *Agent) connectDCSWithRetry(ctx context.Context) error {
 }
 
 // connectMySQLWithRetry connects to MySQL with retry, runs in background
+// 当 MySQL 连接丢失时，会自动尝试修复 MySQL 服务
 func (a *Agent) connectMySQLWithRetry(ctx context.Context) {
+	// 标记正在恢复
+	a.mu.Lock()
+	if a.mysqlRecovering {
+		a.mu.Unlock()
+		a.logger.Debug("MySQL recovery already in progress, skipping")
+		return
+	}
+	a.mysqlRecovering = true
+	a.mu.Unlock()
+
+	// 确保退出时清除标志
+	defer func() {
+		a.mu.Lock()
+		a.mysqlRecovering = false
+		a.mu.Unlock()
+	}()
+
 	maxRetries := 0 // unlimited retries
 	baseDelay := 5 * time.Second
 	maxDelay := 60 * time.Second
 	attempt := 0
+	lastRepairAttempt := time.Time{}
+	repairInterval := 30 * time.Second // 每 30 秒最多尝试修复一次
 
 	for {
 		select {
@@ -244,17 +265,28 @@ func (a *Agent) connectMySQLWithRetry(ctx context.Context) {
 		default:
 		}
 
-		// 在尝试连接 MySQL 前，先确保 MySQL 环境正常
-		if attempt > 0 && attempt%3 == 0 {
-			// 每 3 次连接失败后，尝试修复 MySQL 环境
-			a.logger.Info("attempting to repair MySQL environment before retry")
-			if err := a.repairMySQLEnvironment(); err != nil {
-				a.logger.Warn(fmt.Sprintf("failed to repair MySQL environment: %v", err))
-			}
-		}
-
+		// 先尝试连接 MySQL
 		if err := a.mysql.Connect(); err != nil {
 			attempt++
+
+			// 在连接失败后尝试修复 MySQL 环境
+			// 第一次失败后立即尝试修复，之后每 30 秒尝试一次
+			shouldRepair := attempt == 1 || time.Since(lastRepairAttempt) >= repairInterval
+			if shouldRepair {
+				a.logger.Info(fmt.Sprintf("========== MySQL Auto-Repair (attempt %d) ==========", attempt))
+				a.logger.Info("attempting to repair MySQL environment and restart service...")
+				lastRepairAttempt = time.Now()
+				if repairErr := a.repairMySQLEnvironment(); repairErr != nil {
+					a.logger.Warn(fmt.Sprintf("failed to repair MySQL environment: %v", repairErr))
+				} else {
+					a.logger.Info("MySQL environment repair completed, waiting for service to start...")
+					// 修复后等待一下让 MySQL 启动
+					time.Sleep(5 * time.Second)
+					// 修复后立即重试连接
+					continue
+				}
+			}
+
 			delay := min(baseDelay*time.Duration(1<<uint(min(attempt, 5))), maxDelay)
 			if maxRetries > 0 && attempt >= maxRetries {
 				a.logger.Error(fmt.Sprintf("failed to connect to MySQL after %d attempts, giving up", attempt))
@@ -278,7 +310,7 @@ func (a *Agent) connectMySQLWithRetry(ctx context.Context) {
 		a.mu.Lock()
 		a.mysqlConnected = true
 		a.mu.Unlock()
-		a.logger.Info("connected to MySQL")
+		a.logger.Info("========== MySQL connection restored ==========")
 		return
 	}
 }
@@ -481,6 +513,244 @@ func (a *Agent) isLeaderMySQLReachable(host string, port int) bool {
 	return true
 }
 
+// isEligibleForLeadership 检查自己是否有资格成为 leader
+// 基于 GTID 比较：只有 GTID 最新（或并列最新）的节点才有资格
+// 返回 (是否有资格, 原因)
+func (a *Agent) isEligibleForLeadership(ctx context.Context) (bool, string) {
+	a.logger.Info("========== Replication position based election check ==========")
+
+	// 获取自己的复制位置（优先 GTID，其次 binlog position）
+	myPosition, myTxCount, err := a.mysql.GetReplicationPosition()
+	if err != nil {
+		a.logger.Warn(fmt.Sprintf("[ELECTION] failed to get my replication position: %v", err))
+		// 如果无法获取位置，不参与选举
+		return false, "cannot get my replication position"
+	}
+
+	a.logger.Info(fmt.Sprintf("[ELECTION] My position: %s (value: %d)", truncateGTID(myPosition), myTxCount))
+
+	if myTxCount == 0 {
+		// 位置为 0 可能是新初始化的节点，允许参与选举
+		a.logger.Info("[ELECTION] My position value is 0, allowing election participation (new node)")
+		return true, "position is 0 (new node)"
+	}
+
+	// 获取所有成员的位置信息
+	members, err := a.dcs.GetMembers(ctx)
+	if err != nil {
+		a.logger.Warn(fmt.Sprintf("[ELECTION] failed to get members from DCS: %v", err))
+		// 如果无法获取成员信息，允许参与选举（可能是第一个节点）
+		return true, "cannot get members from DCS"
+	}
+
+	a.logger.Info(fmt.Sprintf("[ELECTION] Found %d members in cluster", len(members)))
+
+	// 找出位置最新的节点
+	var maxPosition int64
+	var maxPositionNodeID string
+	staleThreshold := int64(30) // 30秒内更新过的成员才参与比较
+
+	now := time.Now().Unix()
+	for _, member := range members {
+		age := now - member.UpdatedAt
+		// 跳过不健康或过期的成员
+		if !member.IsHealthy || age > staleThreshold {
+			a.logger.Info(fmt.Sprintf("[ELECTION] Skipping member %s: healthy=%v, age=%ds (stale threshold: %ds)",
+				member.NodeID, member.IsHealthy, age, staleThreshold))
+			continue
+		}
+
+		if member.GTIDExecuted == "" {
+			a.logger.Info(fmt.Sprintf("[ELECTION] Member %s has empty position, skipping", member.NodeID))
+			continue
+		}
+
+		// 解析成员的位置
+		memberTxCount := parseMemberPosition(member.GTIDExecuted)
+		a.logger.Info(fmt.Sprintf("[ELECTION] Member %s: position=%s (value: %d)",
+			member.NodeID, truncateGTID(member.GTIDExecuted), memberTxCount))
+
+		if memberTxCount > maxPosition {
+			maxPosition = memberTxCount
+			maxPositionNodeID = member.NodeID
+		}
+	}
+
+	// 如果没有找到有效的位置，允许参与选举
+	if maxPosition == 0 {
+		a.logger.Info("[ELECTION] No valid position found in cluster, allowing election participation")
+		return true, "no valid position found in cluster"
+	}
+
+	a.logger.Info(fmt.Sprintf("[ELECTION] Max position holder: %s with value %d", maxPositionNodeID, maxPosition))
+
+	// 比较自己的位置和最大位置
+	if myTxCount >= maxPosition {
+		// 自己的位置 >= 最大位置，有资格
+		a.logger.Info(fmt.Sprintf("[ELECTION] ✓ ELIGIBLE: my position (%d) >= max position (%d from %s)",
+			myTxCount, maxPosition, maxPositionNodeID))
+		a.logger.Info("========== Election check passed, can participate in election ==========")
+		return true, "position is up to date"
+	}
+
+	// 自己的位置落后，没有资格
+	a.logger.Info(fmt.Sprintf("[ELECTION] ✗ NOT ELIGIBLE: my position (%d) < max position (%d from %s)",
+		myTxCount, maxPosition, maxPositionNodeID))
+	a.logger.Info("========== Election check failed, waiting for node with more data ==========")
+	return false, fmt.Sprintf("position behind node %s", maxPositionNodeID)
+}
+
+// parseMemberPosition 解析成员的位置值
+func parseMemberPosition(position string) int64 {
+	if position == "" {
+		return 0
+	}
+
+	// 如果是 GTID 格式
+	if len(position) > 5 && position[:5] == "GTID:" {
+		return countGTIDTransactions(position[5:])
+	}
+
+	// 如果是 BINLOG 格式: BINLOG:file:position
+	if len(position) > 7 && position[:7] == "BINLOG:" {
+		parts := splitString(position[7:], ':')
+		if len(parts) >= 2 {
+			var pos int64
+			fmt.Sscanf(parts[1], "%d", &pos)
+			return pos
+		}
+	}
+
+	// 尝试作为纯 GTID 解析
+	return countGTIDTransactions(position)
+}
+
+// compareGTID 比较两个 GTID 集合
+// 返回: >0 如果 a > b, <0 如果 a < b, 0 如果相等
+// 简化实现：比较事务数量（GTID 中的最大 interval）
+func compareGTID(a, b string) int {
+	if a == "" && b == "" {
+		return 0
+	}
+	if a == "" {
+		return -1
+	}
+	if b == "" {
+		return 1
+	}
+
+	// 计算 GTID 中的事务总数
+	countA := countGTIDTransactions(a)
+	countB := countGTIDTransactions(b)
+
+	if countA > countB {
+		return 1
+	} else if countA < countB {
+		return -1
+	}
+	return 0
+}
+
+// countGTIDTransactions 计算 GTID 集合中的事务总数
+// GTID 格式: uuid:1-100,uuid:1-50 表示 100+50=150 个事务
+func countGTIDTransactions(gtid string) int64 {
+	if gtid == "" {
+		return 0
+	}
+
+	var total int64
+	// 按逗号分割多个 UUID 的 GTID
+	parts := splitString(gtid, ',')
+	for _, part := range parts {
+		part = trimSpace(part)
+		if part == "" {
+			continue
+		}
+		// 格式: uuid:intervals 或 uuid:n-m
+		colonIdx := lastIndexOf(part, ':')
+		if colonIdx < 0 {
+			continue
+		}
+		intervals := part[colonIdx+1:]
+		// intervals 可能是 "1-100" 或 "1-100:200-300"
+		rangeParts := splitString(intervals, ':')
+		for _, rp := range rangeParts {
+			rp = trimSpace(rp)
+			dashIdx := indexOf(rp, '-')
+			if dashIdx > 0 {
+				// 范围格式: start-end
+				var start, end int64
+				fmt.Sscanf(rp[:dashIdx], "%d", &start)
+				fmt.Sscanf(rp[dashIdx+1:], "%d", &end)
+				total += end - start + 1
+			} else {
+				// 单个数字
+				var n int64
+				fmt.Sscanf(rp, "%d", &n)
+				if n > 0 {
+					total++
+				}
+			}
+		}
+	}
+	return total
+}
+
+// truncateGTID 截断 GTID 用于日志显示
+func truncateGTID(gtid string) string {
+	if len(gtid) <= 50 {
+		return gtid
+	}
+	return gtid[:47] + "..."
+}
+
+// splitString 分割字符串（避免使用 strings 包）
+func splitString(s string, sep byte) []string {
+	var result []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == sep {
+			result = append(result, s[start:i])
+			start = i + 1
+		}
+	}
+	result = append(result, s[start:])
+	return result
+}
+
+// trimSpace 去除首尾空格
+func trimSpace(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+// indexOf 查找字符位置
+func indexOf(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastIndexOf 查找字符最后出现的位置
+func lastIndexOf(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
 // configureAsReplica configures this node as a replica of the specified leader
 func (a *Agent) configureAsReplica(ctx context.Context, leaderHost string, leaderPort int) error {
 	myHost := a.getMyHost()
@@ -591,12 +861,21 @@ func (a *Agent) Demote(ctx context.Context) error {
 
 // register registers this node with DCS
 func (a *Agent) register(ctx context.Context) error {
+	// 获取当前复制位置（优先 GTID，其次 binlog position）
+	position, _, _ := a.mysql.GetReplicationPosition()
+
+	a.mu.RLock()
 	member := &dcs.Member{
-		NodeID:   a.state.NodeID,
-		Hostname: a.state.Hostname,
-		APIAddr:  fmt.Sprintf("%s:%d", a.config.API.Listen, a.config.API.Port),
-		Role:     string(a.state.Role),
+		NodeID:       a.state.NodeID,
+		Hostname:     a.state.Hostname,
+		APIAddr:      fmt.Sprintf("%s:%d", a.config.API.Listen, a.config.API.Port),
+		Role:         string(a.state.Role),
+		GTIDExecuted: position, // 存储位置信息（GTID 或 binlog position）
+		IsHealthy:    a.state.IsHealthy,
+		UpdatedAt:    time.Now().Unix(),
 	}
+	a.mu.RUnlock()
+
 	return a.dcs.RegisterMember(ctx, member)
 }
 
@@ -623,17 +902,25 @@ func (a *Agent) runLoop(ctx context.Context) {
 // 2. 持有锁的节点是 leader，必须确保 MySQL 是 read-write 且 leader_info 正确
 // 3. 没有锁的节点是 replica，必须确保 MySQL 是 read-only 且复制指向正确的 leader
 // 4. 异常节点恢复后，如果不持有锁，必须降级为 replica
+// 5. MySQL 服务故障时，自动尝试修复和重启
 func (a *Agent) tick(ctx context.Context) {
 	// 更新 MySQL 连接状态
 	if err := a.mysql.Ping(); err != nil {
 		a.mu.Lock()
 		wasConnected := a.mysqlConnected
+		isRecovering := a.mysqlRecovering
 		a.mysqlConnected = false
 		a.state.IsHealthy = false
 		a.mu.Unlock()
 
 		if wasConnected {
+			a.logger.Warn(fmt.Sprintf("========== MySQL connection lost =========="))
 			a.logger.Warn(fmt.Sprintf("MySQL connection lost: %v", err))
+		}
+
+		// 如果没有正在进行恢复，启动恢复
+		if !isRecovering {
+			a.logger.Info("starting automatic MySQL recovery in background...")
 			go a.connectMySQLWithRetry(ctx)
 		}
 
@@ -818,6 +1105,23 @@ func (a *Agent) handleAsNonLeader(ctx context.Context, leaderNodeID, leaderHost 
 		a.mu.Unlock()
 		return
 	}
+
+	// 在尝试获取锁之前，检查自己是否有资格成为 leader（基于 GTID）
+	// 只有 GTID 最新的节点才能参与选举，避免数据丢失
+	eligible, reason := a.isEligibleForLeadership(ctx)
+	if !eligible {
+		a.logger.Info(fmt.Sprintf("not eligible for leadership: %s, waiting for eligible node", reason))
+		// 至少确保是只读模式
+		if err := a.mysql.SetReadOnly(true); err != nil {
+			a.logger.Error(fmt.Sprintf("failed to set read-only: %v", err))
+		}
+		a.mu.Lock()
+		a.state.Role = RoleReplica
+		a.mu.Unlock()
+		return
+	}
+
+	a.logger.Info(fmt.Sprintf("eligible for leadership: %s, attempting to acquire lock", reason))
 
 	// 尝试获取锁
 	acquired, err := a.lockManager.TryAcquire(ctx)

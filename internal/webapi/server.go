@@ -113,13 +113,20 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/clusters/{id}/repair-replication", s.handleRepairReplication).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/nodes/{nodeId}/repair", s.handleRepairNode).Methods("POST", "OPTIONS")
 
-	// Static files for frontend (Vue SPA)
-	s.router.PathPrefix("/assets/").Handler(http.StripPrefix("/assets/", http.FileServer(http.Dir("./web/dist/assets"))))
+	// Health check endpoint
+	s.router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}).Methods("GET")
 
-	// SPA fallback - serve index.html for all non-API routes
-	s.router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "./web/dist/index.html")
-	})
+	// Root endpoint - return API info instead of serving frontend
+	s.router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"service": "MySQL HA Web Admin API",
+			"version": "1.0.0",
+			"api":     "/api/v1",
+			"health":  "/health",
+		})
+	}).Methods("GET")
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

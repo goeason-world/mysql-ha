@@ -25,7 +25,7 @@
         "password": "mngdb",
         "roles": [
           "etcd",
-          "master"
+          "slave"
         ],
         "status": "completed"
       },
@@ -38,7 +38,7 @@
         "password": "mngdb",
         "roles": [
           "etcd",
-          "slave"
+          "master"
         ],
         "status": "completed"
       }
@@ -57,6 +57,6 @@
       "ha_agent_port": 8080
     },
     "phase": "completed",
-    "agent_version": "1.0.3"
+    "agent_version": "1.0.8"
   }
 }

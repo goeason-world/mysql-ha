@@ -32,10 +32,13 @@ type LeaderInfo struct {
 
 // Member represents a cluster member
 type Member struct {
-	NodeID   string `json:"node_id"`
-	Hostname string `json:"hostname"`
-	APIAddr  string `json:"api_addr"`
-	Role     string `json:"role"`
+	NodeID       string `json:"node_id"`
+	Hostname     string `json:"hostname"`
+	APIAddr      string `json:"api_addr"`
+	Role         string `json:"role"`
+	GTIDExecuted string `json:"gtid_executed,omitempty"` // GTID 位置，用于选举时比较
+	IsHealthy    bool   `json:"is_healthy"`              // MySQL 是否健康
+	UpdatedAt    int64  `json:"updated_at"`              // 更新时间戳
 }
 
 // DCS defines the interface for distributed configuration store

@@ -1,9 +1,52 @@
-import axios from 'axios'
+import axios, { AxiosError } from 'axios'
 
 const api = axios.create({
   baseURL: '/api/v1',
   timeout: 30000
 })
+
+// API 错误状态（用于全局错误处理）
+export const apiState = {
+  isBackendAvailable: true,
+  lastError: null as string | null
+}
+
+// 响应拦截器 - 处理后端不可用的情况
+api.interceptors.response.use(
+  (response) => {
+    // 请求成功，标记后端可用
+    apiState.isBackendAvailable = true
+    apiState.lastError = null
+    return response
+  },
+  (error: AxiosError) => {
+    // 网络错误或后端不可用
+    if (!error.response) {
+      apiState.isBackendAvailable = false
+      apiState.lastError = '无法连接到后端服务，请检查服务是否正常运行'
+      console.error('[API] Backend unavailable:', error.message)
+    } else if (error.response.status >= 500) {
+      apiState.isBackendAvailable = false
+      apiState.lastError = `后端服务错误: ${error.response.status}`
+      console.error('[API] Backend error:', error.response.status)
+    }
+    return Promise.reject(error)
+  }
+)
+
+// 健康检查
+export const checkHealth = async (): Promise<boolean> => {
+  try {
+    await axios.get('/health', { timeout: 5000 })
+    apiState.isBackendAvailable = true
+    apiState.lastError = null
+    return true
+  } catch {
+    apiState.isBackendAvailable = false
+    apiState.lastError = '后端服务不可用'
+    return false
+  }
+}
 
 // 类型定义
 export interface Host {

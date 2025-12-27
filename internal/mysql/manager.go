@@ -152,6 +152,143 @@ func (m *Manager) GetGTIDExecuted() (string, error) {
 	return gtid.String, nil
 }
 
+// BinlogPosition represents MySQL binlog position
+type BinlogPosition struct {
+	File     string
+	Position int64
+}
+
+// GetBinlogPosition returns the current binlog position (from SHOW MASTER STATUS)
+func (m *Manager) GetBinlogPosition() (*BinlogPosition, error) {
+	rows, err := m.db.Query("SHOW MASTER STATUS")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get master status: %w", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, fmt.Errorf("no master status available")
+	}
+
+	// SHOW MASTER STATUS 返回: File, Position, Binlog_Do_DB, Binlog_Ignore_DB, Executed_Gtid_Set
+	var file string
+	var position int64
+	var binlogDoDB, binlogIgnoreDB, executedGtidSet sql.NullString
+
+	if err := rows.Scan(&file, &position, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet); err != nil {
+		return nil, fmt.Errorf("failed to scan master status: %w", err)
+	}
+
+	return &BinlogPosition{
+		File:     file,
+		Position: position,
+	}, nil
+}
+
+// GetReplicationPosition returns a comparable position string (GTID or binlog position)
+// 优先使用 GTID，如果 GTID 为空则使用 binlog position
+func (m *Manager) GetReplicationPosition() (string, int64, error) {
+	// 先尝试获取 GTID
+	gtid, err := m.GetGTIDExecuted()
+	if err == nil && gtid != "" {
+		// 计算 GTID 中的事务数作为位置
+		txCount := countGTIDTransactionsInManager(gtid)
+		return fmt.Sprintf("GTID:%s", gtid), txCount, nil
+	}
+
+	// GTID 为空，使用 binlog position
+	binlogPos, err := m.GetBinlogPosition()
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to get replication position: %w", err)
+	}
+
+	// 使用 binlog position 作为位置
+	return fmt.Sprintf("BINLOG:%s:%d", binlogPos.File, binlogPos.Position), binlogPos.Position, nil
+}
+
+// countGTIDTransactionsInManager 计算 GTID 中的事务数（在 manager 包中的版本）
+func countGTIDTransactionsInManager(gtid string) int64 {
+	if gtid == "" {
+		return 0
+	}
+
+	var total int64
+	// 按逗号分割多个 UUID 的 GTID
+	for _, part := range splitStringInManager(gtid, ',') {
+		part = trimSpaceInManager(part)
+		if part == "" {
+			continue
+		}
+		// 格式: uuid:intervals
+		colonIdx := lastIndexOfInManager(part, ':')
+		if colonIdx < 0 {
+			continue
+		}
+		intervals := part[colonIdx+1:]
+		// intervals 可能是 "1-100" 或 "1-100:200-300"
+		for _, rp := range splitStringInManager(intervals, ':') {
+			rp = trimSpaceInManager(rp)
+			dashIdx := indexOfInManager(rp, '-')
+			if dashIdx > 0 {
+				var start, end int64
+				fmt.Sscanf(rp[:dashIdx], "%d", &start)
+				fmt.Sscanf(rp[dashIdx+1:], "%d", &end)
+				total += end - start + 1
+			} else {
+				var n int64
+				fmt.Sscanf(rp, "%d", &n)
+				if n > 0 {
+					total++
+				}
+			}
+		}
+	}
+	return total
+}
+
+func splitStringInManager(s string, sep byte) []string {
+	var result []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == sep {
+			result = append(result, s[start:i])
+			start = i + 1
+		}
+	}
+	result = append(result, s[start:])
+	return result
+}
+
+func trimSpaceInManager(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+func indexOfInManager(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+func lastIndexOfInManager(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
 // IsReadOnly returns true if the server is in read-only mode
 func (m *Manager) IsReadOnly() (bool, error) {
 	var readOnly bool
