@@ -123,25 +123,24 @@ npm run build  # 输出到 web/dist
 
 #### 运行
 
-**方式一：生产模式（推荐）**
+本项目采用前后端分离架构，需要同时启动后端 API 服务和前端服务。
 
 ```bash
-# 启动 webadmin
+# 终端 1：启动后端 API 服务
 ./webadmin
-# 访问 http://localhost:8888
-```
-
-**方式二：开发模式（热重载）**
-
-```bash
-# 终端 1：启动后端
-./webadmin
+# 后端 API 运行在 http://localhost:8888
 
 # 终端 2：启动前端开发服务器
 cd web/frontend
 npm run dev
-# 访问 http://localhost:3000（API 代理到 :8888）
+# 前端运行在 http://localhost:3000
+# 访问 http://localhost:3000 使用系统
 ```
+
+**说明**：
+- 后端 (webadmin) 只提供 REST API，不提供静态文件服务
+- 前端通过 Vite 代理将 `/api` 请求转发到后端 `:8888`
+- 生产部署时，可使用 Nginx 反向代理或将前端构建产物部署到 CDN
 
 #### 部署集群
 
@@ -389,25 +388,24 @@ npm run build  # Output to web/dist
 
 #### Run
 
-**Option 1: Production Mode (Recommended)**
+This project uses a separated frontend-backend architecture. Both the backend API service and frontend service need to be started.
 
 ```bash
-# Start webadmin
+# Terminal 1: Start backend API service
 ./webadmin
-# Access http://localhost:8888
-```
-
-**Option 2: Development Mode (Hot Reload)**
-
-```bash
-# Terminal 1: Start backend
-./webadmin
+# Backend API runs at http://localhost:8888
 
 # Terminal 2: Start frontend dev server
 cd web/frontend
 npm run dev
-# Access http://localhost:3000 (proxies API to :8888)
+# Frontend runs at http://localhost:3000
+# Access http://localhost:3000 to use the system
 ```
+
+**Notes**:
+- Backend (webadmin) only provides REST API, no static file serving
+- Frontend uses Vite proxy to forward `/api` requests to backend `:8888`
+- For production deployment, use Nginx reverse proxy or deploy frontend build to CDN
 
 #### Deploy a Cluster
 
