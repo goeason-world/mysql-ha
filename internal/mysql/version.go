@@ -97,14 +97,15 @@ func NewReplicationCommand(v *Version) *ReplicationCommand {
 func (rc *ReplicationCommand) StartReplicationSQL(masterHost string, masterPort int, user, password string, useGTID bool) string {
 	if rc.Version.Is80() {
 		// MySQL 8.0 uses CHANGE REPLICATION SOURCE
+		// 添加 GET_SOURCE_PUBLIC_KEY=1 解决 caching_sha2_password 认证问题
 		if useGTID {
 			return fmt.Sprintf(
-				"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1",
+				"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1",
 				masterHost, masterPort, user, password,
 			)
 		}
 		return fmt.Sprintf(
-			"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s'",
+			"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', GET_SOURCE_PUBLIC_KEY=1",
 			masterHost, masterPort, user, password,
 		)
 	}

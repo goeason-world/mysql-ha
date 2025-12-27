@@ -1,10 +1,10 @@
 {
-  "f88db10d-5e60-42c9-a445-24b967280f45": {
-    "id": "f88db10d-5e60-42c9-a445-24b967280f45",
+  "0a8decae-fab1-4068-bb78-6a2c0d815f73": {
+    "id": "0a8decae-fab1-4068-bb78-6a2c0d815f73",
     "name": "mysql-cluster",
     "hosts": [
       {
-        "id": "d69feded-6eb5-4c57-883f-f3b6daef6c68",
+        "id": "0baa824a-4123-4bf6-abfa-9dd0b687d3bb",
         "name": "mysql-node-1",
         "ip": "10.211.55.32",
         "port": 22,
@@ -14,10 +14,10 @@
           "etcd",
           "slave"
         ],
-        "status": "completed"
+        "status": "mysql_installed"
       },
       {
-        "id": "eab5b486-1c38-425b-b8cd-9dee0ea7e476",
+        "id": "4418faea-0f1c-4973-855a-58772ad0fb21",
         "name": "mysql-node-2",
         "ip": "10.211.55.33",
         "port": 22,
@@ -27,10 +27,10 @@
           "etcd",
           "slave"
         ],
-        "status": "completed"
+        "status": "mysql_installed"
       },
       {
-        "id": "3b0daccb-55f5-4a59-9539-f5487a2cc75e",
+        "id": "03d6499b-af3f-4ed8-8569-72a015a53913",
         "name": "mysql-node-3",
         "ip": "10.211.55.34",
         "port": 22,
@@ -40,11 +40,11 @@
           "etcd",
           "master"
         ],
-        "status": "completed"
+        "status": "mysql_installed"
       }
     ],
     "etcd_version": "3.5.13",
-    "mysql_version": "5.7.44",
+    "mysql_version": "8.0.36",
     "install_path": "/opt/mysql-ha",
     "data_path": "/data/mysqldata",
     "settings": {
@@ -56,7 +56,7 @@
       "root_password": "Root@123456",
       "ha_agent_port": 8080
     },
-    "phase": "completed",
-    "agent_version": "1.0.9"
+    "phase": "failed_phase3",
+    "agent_version": "1.0.12"
   }
 }

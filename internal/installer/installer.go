@@ -768,6 +768,14 @@ WantedBy=multi-user.target
 `, dataPath, dataPath, dataPath, installPath)
 }
 
+// escapeYAMLString escapes special characters in YAML string values
+func escapeYAMLString(s string) string {
+	// 替换反斜杠和双引号
+	result := strings.ReplaceAll(s, "\\", "\\\\")
+	result = strings.ReplaceAll(result, "\"", "\\\"")
+	return result
+}
+
 func generateAgentConfig(host *Host, config *ClusterConfig) string {
 	var etcdEndpoints []string
 	for _, h := range config.Hosts {
@@ -781,6 +789,10 @@ func generateAgentConfig(host *Host, config *ClusterConfig) string {
 	if agentVersion == "" {
 		agentVersion = "1.0.0"
 	}
+
+	// 转义密码中的特殊字符
+	rootPassword := escapeYAMLString(config.Settings.RootPassword)
+	replPassword := escapeYAMLString(config.Settings.ReplicationPass)
 
 	return fmt.Sprintf(`name: %s
 namespace: mypatroni
@@ -821,9 +833,9 @@ ha:
 		agentVersion,
 		formatEndpoints(etcdEndpoints),
 		config.Settings.MySQLPort,
-		config.Settings.RootPassword,
+		rootPassword,
 		config.Settings.ReplicationUser,
-		config.Settings.ReplicationPass,
+		replPassword,
 		config.Settings.HAAgentPort,
 	)
 }
@@ -853,6 +865,7 @@ WantedBy=multi-user.target
 }
 
 // ConfigureReplication configures MySQL replication for the cluster
+// 支持 MySQL 5.7 和 8.0 的不同语法
 func (i *Installer) ConfigureReplication(config *ClusterConfig) error {
 	var mysqlHosts []*Host
 	for idx := range config.Hosts {
@@ -878,28 +891,97 @@ func (i *Installer) ConfigureReplication(config *ClusterConfig) error {
 		return fmt.Errorf("failed to get master status: %w", err)
 	}
 
+	// 检测 MySQL 版本以使用正确的复制命令语法
+	isMySQL80 := strings.HasPrefix(config.MySQLVersion, "8.0")
+
 	for _, slave := range mysqlHosts[1:] {
 		slaveClient, err := NewSSHClient(slave)
 		if err != nil {
 			return fmt.Errorf("failed to connect to slave %s: %w", slave.Name, err)
 		}
 
-		replCmd := fmt.Sprintf(`%s/mysql/bin/mysql -u root -p'%s' -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1; START SLAVE;"`,
-			config.InstallPath, config.Settings.RootPassword,
-			master.IP, config.Settings.MySQLPort,
-			config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+		// 添加 --socket 参数确保连接正确
+		mysqlCmd := fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock",
+			config.InstallPath, config.Settings.RootPassword)
 
-		if _, err := slaveClient.Run(replCmd); err != nil {
+		var stopCmd, changeCmd, startCmd, showCmd string
+		if isMySQL80 {
+			// MySQL 8.0 语法
+			// 添加 GET_SOURCE_PUBLIC_KEY=1 解决 caching_sha2_password 认证问题
+			stopCmd = fmt.Sprintf(`%s -e "STOP REPLICA;"`, mysqlCmd)
+			changeCmd = fmt.Sprintf(`%s -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;"`,
+				mysqlCmd, master.IP, config.Settings.MySQLPort,
+				config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+			startCmd = fmt.Sprintf(`%s -e "START REPLICA;"`, mysqlCmd)
+			showCmd = fmt.Sprintf(`%s -e "SHOW REPLICA STATUS\G"`, mysqlCmd)
+		} else {
+			// MySQL 5.7 语法
+			stopCmd = fmt.Sprintf(`%s -e "STOP SLAVE;"`, mysqlCmd)
+			changeCmd = fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1;"`,
+				mysqlCmd, master.IP, config.Settings.MySQLPort,
+				config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+			startCmd = fmt.Sprintf(`%s -e "START SLAVE;"`, mysqlCmd)
+			showCmd = fmt.Sprintf(`%s -e "SHOW SLAVE STATUS\G"`, mysqlCmd)
+		}
+
+		// 执行停止复制
+		if _, err := slaveClient.Run(stopCmd); err != nil {
+			// 忽略停止错误，可能本来就没有运行
+		}
+
+		// 配置复制
+		if _, err := slaveClient.Run(changeCmd); err != nil {
 			slaveClient.Close()
 			return fmt.Errorf("failed to configure replication on %s: %w", slave.Name, err)
 		}
 
-		checkCmd := fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' -e \"SHOW SLAVE STATUS\\G\"",
-			config.InstallPath, config.Settings.RootPassword)
-		output, _ := slaveClient.Run(checkCmd)
-		if !strings.Contains(output, "Slave_IO_Running: Yes") || !strings.Contains(output, "Slave_SQL_Running: Yes") {
+		// 启动复制
+		if _, err := slaveClient.Run(startCmd); err != nil {
 			slaveClient.Close()
-			return fmt.Errorf("replication not running properly on %s", slave.Name)
+			return fmt.Errorf("failed to start replication on %s: %w", slave.Name, err)
+		}
+
+		// 等待复制启动，增加重试逻辑
+		var ioRunning, sqlRunning bool
+		var output string
+		for retry := 0; retry < 10; retry++ {
+			time.Sleep(2 * time.Second)
+
+			// 检查复制状态
+			output, _ = slaveClient.Run(showCmd)
+			// MySQL 8.0 使用 Replica_IO_Running / Replica_SQL_Running
+			// MySQL 5.7 使用 Slave_IO_Running / Slave_SQL_Running
+			ioRunning = strings.Contains(output, "Slave_IO_Running: Yes") || strings.Contains(output, "Replica_IO_Running: Yes")
+			sqlRunning = strings.Contains(output, "Slave_SQL_Running: Yes") || strings.Contains(output, "Replica_SQL_Running: Yes")
+
+			if ioRunning && sqlRunning {
+				break
+			}
+
+			// 如果 IO 线程正在连接中，继续等待
+			if strings.Contains(output, "Slave_IO_Running: Connecting") || strings.Contains(output, "Replica_IO_Running: Connecting") {
+				continue
+			}
+
+			// 检查是否有错误
+			if strings.Contains(output, "Last_IO_Error:") {
+				// 提取错误信息
+				lines := strings.Split(output, "\n")
+				for _, line := range lines {
+					if strings.Contains(line, "Last_IO_Error:") && !strings.HasSuffix(strings.TrimSpace(line), "Last_IO_Error:") {
+						fmt.Printf("[DEBUG] [%s] IO Error: %s\n", slave.Name, line)
+						break
+					}
+				}
+			}
+		}
+
+		if !ioRunning || !sqlRunning {
+			// 输出详细错误信息用于调试
+			fmt.Printf("[DEBUG] [%s] Replication status output:\n%s\n", slave.Name, output)
+			fmt.Printf("[DEBUG] [%s] isMySQL80=%v, ioRunning=%v, sqlRunning=%v\n", slave.Name, isMySQL80, ioRunning, sqlRunning)
+			slaveClient.Close()
+			return fmt.Errorf("replication not running properly on %s (IO: %v, SQL: %v)", slave.Name, ioRunning, sqlRunning)
 		}
 		slaveClient.Close()
 	}
@@ -1093,6 +1175,9 @@ func (i *Installer) VerifyReplication(config *ClusterConfig) error {
 		return nil // 单节点无需验证
 	}
 
+	// 检测 MySQL 版本
+	isMySQL80 := strings.HasPrefix(config.MySQLVersion, "8.0")
+
 	// 检查每个 slave 的复制状态
 	for _, slave := range mysqlHosts[1:] {
 		client, err := NewSSHClient(slave)
@@ -1100,20 +1185,57 @@ func (i *Installer) VerifyReplication(config *ClusterConfig) error {
 			return fmt.Errorf("failed to connect to slave %s: %w", slave.Name, err)
 		}
 
-		checkCmd := fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock -e \"SHOW SLAVE STATUS\\G\"",
-			config.InstallPath, config.Settings.RootPassword)
-		output, err := client.Run(checkCmd)
+		// 根据版本使用不同的命令
+		var checkCmd string
+		if isMySQL80 {
+			checkCmd = fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock -e \"SHOW REPLICA STATUS\\G\"",
+				config.InstallPath, config.Settings.RootPassword)
+		} else {
+			checkCmd = fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock -e \"SHOW SLAVE STATUS\\G\"",
+				config.InstallPath, config.Settings.RootPassword)
+		}
+
+		// 添加重试逻辑，最多等待 20 秒
+		var ioRunning, sqlRunning bool
+		var output string
+		var lastErr error
+
+		for retry := 0; retry < 10; retry++ {
+			output, lastErr = client.Run(checkCmd)
+			if lastErr != nil {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			// MySQL 8.0 使用 Replica_IO_Running / Replica_SQL_Running
+			// MySQL 5.7 使用 Slave_IO_Running / Slave_SQL_Running
+			ioRunning = strings.Contains(output, "Slave_IO_Running: Yes") || strings.Contains(output, "Replica_IO_Running: Yes")
+			sqlRunning = strings.Contains(output, "Slave_SQL_Running: Yes") || strings.Contains(output, "Replica_SQL_Running: Yes")
+
+			if ioRunning && sqlRunning {
+				break
+			}
+
+			// 如果 IO 线程正在连接中，继续等待
+			if strings.Contains(output, "Slave_IO_Running: Connecting") || strings.Contains(output, "Replica_IO_Running: Connecting") {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			time.Sleep(2 * time.Second)
+		}
+
 		client.Close()
 
-		if err != nil {
-			return fmt.Errorf("failed to check replication status on %s: %w", slave.Name, err)
+		if lastErr != nil {
+			return fmt.Errorf("failed to check replication status on %s: %w", slave.Name, lastErr)
 		}
 
-		if !strings.Contains(output, "Slave_IO_Running: Yes") {
-			return fmt.Errorf("Slave_IO_Running is not Yes on %s", slave.Name)
+		if !ioRunning {
+			return fmt.Errorf("IO thread is not running on %s", slave.Name)
 		}
-		if !strings.Contains(output, "Slave_SQL_Running: Yes") {
-			return fmt.Errorf("Slave_SQL_Running is not Yes on %s", slave.Name)
+		if !sqlRunning {
+			return fmt.Errorf("SQL thread is not running on %s", slave.Name)
 		}
 	}
 
@@ -1146,6 +1268,9 @@ func (i *Installer) PerformSwitchover(config *ClusterConfig, newMasterID string)
 		return fmt.Errorf("new master is already the current master")
 	}
 
+	// 检测 MySQL 版本
+	isMySQL80 := strings.HasPrefix(config.MySQLVersion, "8.0")
+
 	mysqlCmd := func(host *Host) string {
 		return fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock",
 			config.InstallPath, config.Settings.RootPassword)
@@ -1173,9 +1298,17 @@ func (i *Installer) PerformSwitchover(config *ClusterConfig, newMasterID string)
 	defer newMasterClient.Close()
 
 	// 等待复制追上（最多等待30秒）
+	// 根据版本使用不同的命令
+	var showStatusCmd string
+	if isMySQL80 {
+		showStatusCmd = fmt.Sprintf("%s -e \"SHOW REPLICA STATUS\\G\"", mysqlCmd(newMaster))
+	} else {
+		showStatusCmd = fmt.Sprintf("%s -e \"SHOW SLAVE STATUS\\G\"", mysqlCmd(newMaster))
+	}
+
 	for retry := 0; retry < 30; retry++ {
-		output, _ := newMasterClient.Run(fmt.Sprintf("%s -e \"SHOW SLAVE STATUS\\G\"", mysqlCmd(newMaster)))
-		if strings.Contains(output, "Seconds_Behind_Master: 0") {
+		output, _ := newMasterClient.Run(showStatusCmd)
+		if strings.Contains(output, "Seconds_Behind_Master: 0") || strings.Contains(output, "Seconds_Behind_Source: 0") {
 			break
 		}
 		if retry == 29 {
@@ -1187,7 +1320,14 @@ func (i *Installer) PerformSwitchover(config *ClusterConfig, newMasterID string)
 	}
 
 	// Step 3: 在新主节点上停止复制并重置
-	if _, err := newMasterClient.Run(fmt.Sprintf("%s -e \"STOP SLAVE; RESET SLAVE ALL;\"", mysqlCmd(newMaster))); err != nil {
+	var stopResetCmd string
+	if isMySQL80 {
+		stopResetCmd = fmt.Sprintf("%s -e \"STOP REPLICA; RESET REPLICA ALL;\"", mysqlCmd(newMaster))
+	} else {
+		stopResetCmd = fmt.Sprintf("%s -e \"STOP SLAVE; RESET SLAVE ALL;\"", mysqlCmd(newMaster))
+	}
+
+	if _, err := newMasterClient.Run(stopResetCmd); err != nil {
 		oldMasterClient.Run(fmt.Sprintf("%s -e \"SET GLOBAL read_only = OFF;\"", mysqlCmd(oldMaster)))
 		return fmt.Errorf("failed to stop slave on new master: %w", err)
 	}
@@ -1198,9 +1338,17 @@ func (i *Installer) PerformSwitchover(config *ClusterConfig, newMasterID string)
 	}
 
 	// Step 5: 将旧主节点配置为新主节点的从节点
-	replCmd := fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1; START SLAVE;"`,
-		mysqlCmd(oldMaster), newMaster.IP, config.Settings.MySQLPort,
-		config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+	var replCmd string
+	if isMySQL80 {
+		replCmd = fmt.Sprintf(`%s -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"`,
+			mysqlCmd(oldMaster), newMaster.IP, config.Settings.MySQLPort,
+			config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+	} else {
+		replCmd = fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1; START SLAVE;"`,
+			mysqlCmd(oldMaster), newMaster.IP, config.Settings.MySQLPort,
+			config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+	}
+
 	if _, err := oldMasterClient.Run(replCmd); err != nil {
 		return fmt.Errorf("failed to configure old master as slave: %w", err)
 	}
@@ -1217,10 +1365,18 @@ func (i *Installer) PerformSwitchover(config *ClusterConfig, newMasterID string)
 			continue // 跳过无法连接的节点
 		}
 
-		replCmd := fmt.Sprintf(`%s -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1; START SLAVE;"`,
-			mysqlCmd(host), newMaster.IP, config.Settings.MySQLPort,
-			config.Settings.ReplicationUser, config.Settings.ReplicationPass)
-		slaveClient.Run(replCmd)
+		var slaveReplCmd string
+		if isMySQL80 {
+			slaveReplCmd = fmt.Sprintf(`%s -e "STOP REPLICA; CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"`,
+				mysqlCmd(host), newMaster.IP, config.Settings.MySQLPort,
+				config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+		} else {
+			slaveReplCmd = fmt.Sprintf(`%s -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1; START SLAVE;"`,
+				mysqlCmd(host), newMaster.IP, config.Settings.MySQLPort,
+				config.Settings.ReplicationUser, config.Settings.ReplicationPass)
+		}
+
+		slaveClient.Run(slaveReplCmd)
 		slaveClient.Close()
 	}
 

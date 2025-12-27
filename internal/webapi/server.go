@@ -1317,15 +1317,12 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 查找目标节点和当前 leader
+	// 查找目标节点
 	var targetHost *installer.Host
-	var currentLeaderHost *installer.Host
 	for i := range cluster.Hosts {
 		if cluster.Hosts[i].ID == req.TargetNodeID {
 			targetHost = &cluster.Hosts[i]
-		}
-		if cluster.Hosts[i].HasRole(installer.RoleMaster) {
-			currentLeaderHost = &cluster.Hosts[i]
+			break
 		}
 	}
 
@@ -1339,6 +1336,32 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[INFO] Starting switchover to node %s (%s), reason: %s", targetHost.Name, targetHost.IP, req.Reason)
 
 		client := &http.Client{Timeout: 60 * time.Second}
+
+		// Step 0: 从各节点的 Agent 获取真正的 leader（通过 /state API）
+		var currentLeaderHost *installer.Host
+		for i := range cluster.Hosts {
+			host := &cluster.Hosts[i]
+			if !host.IsMySQLNode() {
+				continue
+			}
+			// 查询 Agent 状态
+			agentURL := fmt.Sprintf("http://%s:%d/state", host.IP, cluster.Settings.HAAgentPort)
+			resp, err := client.Get(agentURL)
+			if err != nil {
+				log.Printf("[DEBUG] Cannot reach agent on %s: %v", host.Name, err)
+				continue
+			}
+			var agentState struct {
+				Role string `json:"role"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&agentState) == nil {
+				if agentState.Role == "leader" {
+					currentLeaderHost = host
+					log.Printf("[INFO] Found current leader from agent: %s (%s)", host.Name, host.IP)
+				}
+			}
+			resp.Body.Close()
+		}
 
 		// Step 1: 先通知当前 leader 释放锁（如果有的话）
 		if currentLeaderHost != nil && currentLeaderHost.ID != req.TargetNodeID {
@@ -1360,6 +1383,10 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 
 			// 等待锁释放
 			time.Sleep(2 * time.Second)
+		} else if currentLeaderHost == nil {
+			log.Printf("[WARN] No current leader found, proceeding with switchover anyway")
+		} else {
+			log.Printf("[INFO] Target node is already the leader, skipping demote step")
 		}
 
 		// Step 2: 调用目标节点的 HA Agent /api/v1/switchover API
@@ -1641,6 +1668,16 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 	s.checkAndUpdateAgentVersion()
 	currentVersion := s.GetAgentVersion()
 	log.Printf("[DEBUG] 当前 Agent 版本: %s, Force: %v", currentVersion, req.Force)
+
+	// 如果没有指定节点，默认更新所有 MySQL 节点
+	if len(req.NodeIDs) == 0 {
+		for _, host := range cluster.Hosts {
+			if host.IsMySQLNode() {
+				req.NodeIDs = append(req.NodeIDs, host.ID)
+			}
+		}
+		log.Printf("[DEBUG] 未指定节点，将更新所有 MySQL 节点: %v", req.NodeIDs)
+	}
 
 	// 检查是否需要更新（比较版本号）
 	// 获取节点当前的版本号
@@ -2232,7 +2269,13 @@ func (s *Server) handleRepairReplication(w http.ResponseWriter, r *http.Request)
 			cluster.InstallPath, cluster.Settings.RootPassword)
 
 		// 停止复制（如果有）并设置为可写
-		masterClient.Run(fmt.Sprintf("%s -e \"STOP SLAVE; RESET SLAVE ALL;\"", mysqlCmd))
+		// 根据 MySQL 版本使用不同的命令
+		isMySQL80 := strings.HasPrefix(cluster.MySQLVersion, "8.0")
+		if isMySQL80 {
+			masterClient.Run(fmt.Sprintf("%s -e \"STOP REPLICA; RESET REPLICA ALL;\"", mysqlCmd))
+		} else {
+			masterClient.Run(fmt.Sprintf("%s -e \"STOP SLAVE; RESET SLAVE ALL;\"", mysqlCmd))
+		}
 		masterClient.Run(fmt.Sprintf("%s -e \"SET GLOBAL read_only = OFF;\"", mysqlCmd))
 		masterClient.Close()
 		log.Printf("[INFO] 主节点 %s 已配置为 read-write", actualMaster.Name)
@@ -2255,44 +2298,76 @@ func (s *Server) handleRepairReplication(w http.ResponseWriter, r *http.Request)
 			mysqlCmd := fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock",
 				cluster.InstallPath, cluster.Settings.RootPassword)
 
+			// 根据 MySQL 版本使用不同的命令
+			isMySQL80 := strings.HasPrefix(cluster.MySQLVersion, "8.0")
+
 			// 停止现有复制并完全重置
 			log.Printf("[INFO] [%s] 停止并重置复制...", host.Name)
-			client.Run(fmt.Sprintf("%s -e \"STOP SLAVE;\"", mysqlCmd))
-			client.Run(fmt.Sprintf("%s -e \"RESET SLAVE ALL;\"", mysqlCmd))
+			if isMySQL80 {
+				client.Run(fmt.Sprintf("%s -e \"STOP REPLICA;\"", mysqlCmd))
+				client.Run(fmt.Sprintf("%s -e \"RESET REPLICA ALL;\"", mysqlCmd))
+			} else {
+				client.Run(fmt.Sprintf("%s -e \"STOP SLAVE;\"", mysqlCmd))
+				client.Run(fmt.Sprintf("%s -e \"RESET SLAVE ALL;\"", mysqlCmd))
+			}
 
 			// 设置只读
 			client.Run(fmt.Sprintf("%s -e \"SET GLOBAL read_only = ON;\"", mysqlCmd))
 
 			// 重新配置复制 - 使用单独的命令确保每步都执行
-			log.Printf("[INFO] [%s] 配置 CHANGE MASTER...", host.Name)
-			changeMasterCmd := fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1;"`,
-				mysqlCmd, actualMaster.IP, cluster.Settings.MySQLPort,
-				cluster.Settings.ReplicationUser, cluster.Settings.ReplicationPass)
+			log.Printf("[INFO] [%s] 配置复制...", host.Name)
+			var changeMasterCmd string
+			if isMySQL80 {
+				changeMasterCmd = fmt.Sprintf(`%s -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;"`,
+					mysqlCmd, actualMaster.IP, cluster.Settings.MySQLPort,
+					cluster.Settings.ReplicationUser, cluster.Settings.ReplicationPass)
+			} else {
+				changeMasterCmd = fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1;"`,
+					mysqlCmd, actualMaster.IP, cluster.Settings.MySQLPort,
+					cluster.Settings.ReplicationUser, cluster.Settings.ReplicationPass)
+			}
 
 			output, err := client.Run(changeMasterCmd)
 			if err != nil {
-				log.Printf("[ERROR] [%s] CHANGE MASTER 失败: %v, output: %s", host.Name, err, output)
+				log.Printf("[ERROR] [%s] 配置复制失败: %v, output: %s", host.Name, err, output)
 				client.Close()
 				continue
 			}
-			log.Printf("[INFO] [%s] CHANGE MASTER 成功", host.Name)
+			log.Printf("[INFO] [%s] 配置复制成功", host.Name)
 
 			// 启动复制
-			log.Printf("[INFO] [%s] 启动 SLAVE...", host.Name)
-			output, err = client.Run(fmt.Sprintf("%s -e \"START SLAVE;\"", mysqlCmd))
+			log.Printf("[INFO] [%s] 启动复制...", host.Name)
+			var startCmd string
+			if isMySQL80 {
+				startCmd = fmt.Sprintf("%s -e \"START REPLICA;\"", mysqlCmd)
+			} else {
+				startCmd = fmt.Sprintf("%s -e \"START SLAVE;\"", mysqlCmd)
+			}
+			output, err = client.Run(startCmd)
 			if err != nil {
-				log.Printf("[ERROR] [%s] START SLAVE 失败: %v, output: %s", host.Name, err, output)
+				log.Printf("[ERROR] [%s] 启动复制失败: %v, output: %s", host.Name, err, output)
 				client.Close()
 				continue
 			}
-			log.Printf("[INFO] [%s] START SLAVE 成功", host.Name)
+			log.Printf("[INFO] [%s] 启动复制成功", host.Name)
 
 			// 验证复制状态
 			time.Sleep(3 * time.Second)
-			output, _ = client.Run(fmt.Sprintf("%s -e \"SHOW SLAVE STATUS\\G\"", mysqlCmd))
-			log.Printf("[DEBUG] [%s] SHOW SLAVE STATUS 输出:\n%s", host.Name, output)
+			var showStatusCmd string
+			if isMySQL80 {
+				showStatusCmd = fmt.Sprintf("%s -e \"SHOW REPLICA STATUS\\G\"", mysqlCmd)
+			} else {
+				showStatusCmd = fmt.Sprintf("%s -e \"SHOW SLAVE STATUS\\G\"", mysqlCmd)
+			}
+			output, _ = client.Run(showStatusCmd)
+			log.Printf("[DEBUG] [%s] 复制状态输出:\n%s", host.Name, output)
 
-			if strings.Contains(output, "Slave_IO_Running: Yes") && strings.Contains(output, "Slave_SQL_Running: Yes") {
+			// MySQL 8.0 使用 Replica_IO_Running / Replica_SQL_Running
+			// MySQL 5.7 使用 Slave_IO_Running / Slave_SQL_Running
+			ioRunning := strings.Contains(output, "Slave_IO_Running: Yes") || strings.Contains(output, "Replica_IO_Running: Yes")
+			sqlRunning := strings.Contains(output, "Slave_SQL_Running: Yes") || strings.Contains(output, "Replica_SQL_Running: Yes")
+
+			if ioRunning && sqlRunning {
 				log.Printf("[INFO] [%s] 复制配置成功 ✓", host.Name)
 			} else {
 				// 提取错误信息
@@ -2631,14 +2706,27 @@ func (s *Server) handleRepairNode(w http.ResponseWriter, r *http.Request) {
 		if hasOtherLeader && masterHost != nil {
 			log.Printf("[INFO] [%s] 集群已有主节点 %s，将此节点配置为从节点", targetHost.Name, masterHost.Name)
 
+			// 根据 MySQL 版本使用不同的命令
+			isMySQL80 := strings.HasPrefix(cluster.MySQLVersion, "8.0")
+
 			// 如果 agent 已启动，等待它自动配置
 			if agentActive {
 				log.Printf("[INFO] [%s] 等待 mypatroni 自动配置复制（15秒）...", targetHost.Name)
 				time.Sleep(15 * time.Second)
 
 				// 检查 agent 是否自动配置了复制
-				output, _ = client.Run(fmt.Sprintf("%s -e 'SHOW SLAVE STATUS\\G' 2>&1", mysqlCmd))
-				if strings.Contains(output, "Slave_IO_Running: Yes") && strings.Contains(output, "Slave_SQL_Running: Yes") {
+				var showStatusCmd string
+				if isMySQL80 {
+					showStatusCmd = fmt.Sprintf("%s -e 'SHOW REPLICA STATUS\\G' 2>&1", mysqlCmd)
+				} else {
+					showStatusCmd = fmt.Sprintf("%s -e 'SHOW SLAVE STATUS\\G' 2>&1", mysqlCmd)
+				}
+				output, _ = client.Run(showStatusCmd)
+				// MySQL 8.0 使用 Replica_IO_Running / Replica_SQL_Running
+				// MySQL 5.7 使用 Slave_IO_Running / Slave_SQL_Running
+				ioRunning := strings.Contains(output, "Slave_IO_Running: Yes") || strings.Contains(output, "Replica_IO_Running: Yes")
+				sqlRunning := strings.Contains(output, "Slave_SQL_Running: Yes") || strings.Contains(output, "Replica_SQL_Running: Yes")
+				if ioRunning && sqlRunning {
 					log.Printf("[INFO] [%s] mypatroni 已自动配置复制 ✓", targetHost.Name)
 					log.Printf("[INFO] ========================================")
 					log.Printf("[INFO] 节点 %s 修复完成（由 agent 自动配置）", targetHost.Name)
@@ -2653,8 +2741,13 @@ func (s *Server) handleRepairNode(w http.ResponseWriter, r *http.Request) {
 
 			// 停止现有复制
 			log.Printf("[INFO] [%s] 停止现有复制...", targetHost.Name)
-			client.Run(fmt.Sprintf("%s -e 'STOP SLAVE;' 2>&1", mysqlCmd))
-			client.Run(fmt.Sprintf("%s -e 'RESET SLAVE ALL;' 2>&1", mysqlCmd))
+			if isMySQL80 {
+				client.Run(fmt.Sprintf("%s -e 'STOP REPLICA;' 2>&1", mysqlCmd))
+				client.Run(fmt.Sprintf("%s -e 'RESET REPLICA ALL;' 2>&1", mysqlCmd))
+			} else {
+				client.Run(fmt.Sprintf("%s -e 'STOP SLAVE;' 2>&1", mysqlCmd))
+				client.Run(fmt.Sprintf("%s -e 'RESET SLAVE ALL;' 2>&1", mysqlCmd))
+			}
 
 			// 设置只读
 			log.Printf("[INFO] [%s] 设置为只读模式...", targetHost.Name)
@@ -2663,33 +2756,54 @@ func (s *Server) handleRepairNode(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[WARN] [%s] 设置只读失败: %v, output: %s", targetHost.Name, err, output)
 			}
 
-			// 配置 CHANGE MASTER
-			log.Printf("[INFO] [%s] 配置 CHANGE MASTER...", targetHost.Name)
-			changeMasterCmd := fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1;" 2>&1`,
-				mysqlCmd, masterHost.IP, cluster.Settings.MySQLPort,
-				cluster.Settings.ReplicationUser, cluster.Settings.ReplicationPass)
+			// 配置复制
+			log.Printf("[INFO] [%s] 配置复制...", targetHost.Name)
+			var changeMasterCmd string
+			if isMySQL80 {
+				changeMasterCmd = fmt.Sprintf(`%s -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;" 2>&1`,
+					mysqlCmd, masterHost.IP, cluster.Settings.MySQLPort,
+					cluster.Settings.ReplicationUser, cluster.Settings.ReplicationPass)
+			} else {
+				changeMasterCmd = fmt.Sprintf(`%s -e "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1;" 2>&1`,
+					mysqlCmd, masterHost.IP, cluster.Settings.MySQLPort,
+					cluster.Settings.ReplicationUser, cluster.Settings.ReplicationPass)
+			}
 
 			output, err = client.Run(changeMasterCmd)
 			if err != nil {
-				log.Printf("[ERROR] [%s] CHANGE MASTER 失败: %v, output: %s", targetHost.Name, err, output)
+				log.Printf("[ERROR] [%s] 配置复制失败: %v, output: %s", targetHost.Name, err, output)
 				return
 			}
-			log.Printf("[INFO] [%s] CHANGE MASTER 成功", targetHost.Name)
+			log.Printf("[INFO] [%s] 配置复制成功", targetHost.Name)
 
 			// 启动复制
 			log.Printf("[INFO] [%s] 启动复制...", targetHost.Name)
-			output, err = client.Run(fmt.Sprintf("%s -e 'START SLAVE;' 2>&1", mysqlCmd))
+			var startCmd string
+			if isMySQL80 {
+				startCmd = fmt.Sprintf("%s -e 'START REPLICA;' 2>&1", mysqlCmd)
+			} else {
+				startCmd = fmt.Sprintf("%s -e 'START SLAVE;' 2>&1", mysqlCmd)
+			}
+			output, err = client.Run(startCmd)
 			if err != nil {
-				log.Printf("[ERROR] [%s] START SLAVE 失败: %v, output: %s", targetHost.Name, err, output)
+				log.Printf("[ERROR] [%s] 启动复制失败: %v, output: %s", targetHost.Name, err, output)
 				return
 			}
 
 			// 验证复制状态
 			time.Sleep(3 * time.Second)
-			output, _ = client.Run(fmt.Sprintf("%s -e 'SHOW SLAVE STATUS\\G' 2>&1", mysqlCmd))
+			var showStatusCmd string
+			if isMySQL80 {
+				showStatusCmd = fmt.Sprintf("%s -e 'SHOW REPLICA STATUS\\G' 2>&1", mysqlCmd)
+			} else {
+				showStatusCmd = fmt.Sprintf("%s -e 'SHOW SLAVE STATUS\\G' 2>&1", mysqlCmd)
+			}
+			output, _ = client.Run(showStatusCmd)
 
-			ioRunning := strings.Contains(output, "Slave_IO_Running: Yes")
-			sqlRunning := strings.Contains(output, "Slave_SQL_Running: Yes")
+			// MySQL 8.0 使用 Replica_IO_Running / Replica_SQL_Running
+			// MySQL 5.7 使用 Slave_IO_Running / Slave_SQL_Running
+			ioRunning := strings.Contains(output, "Slave_IO_Running: Yes") || strings.Contains(output, "Replica_IO_Running: Yes")
+			sqlRunning := strings.Contains(output, "Slave_SQL_Running: Yes") || strings.Contains(output, "Replica_SQL_Running: Yes")
 
 			if ioRunning && sqlRunning {
 				log.Printf("[INFO] [%s] 复制配置成功 ✓", targetHost.Name)

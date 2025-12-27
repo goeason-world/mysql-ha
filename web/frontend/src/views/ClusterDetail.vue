@@ -140,97 +140,104 @@
           <div class="section-header">
             <h2>🗄️ MySQL 集群控制</h2>
             <div class="header-actions">
+              <button class="btn btn-primary" @click="refreshMySQLStatus" :disabled="refreshing">
+                🔄 刷新状态
+              </button>
+              <button class="btn btn-danger" @click="showRepairDialog">
+                ⚠️ 一键修复主从
+              </button>
               <label class="auto-refresh-toggle">
                 <input type="checkbox" v-model="autoRefreshMySQL" />
                 <span>自动刷新</span>
               </label>
-              <button class="btn btn-danger" @click="showRepairDialog">
-                ⚠️ 一键修复主从
-              </button>
             </div>
           </div>
 
           <div class="card">
             <div class="card-header">
-              <span class="card-title">👑 主节点 (Leader)</span>
+              <span class="card-title">MySQL 节点列表</span>
               <span class="tag" :class="clusterStatus?.leader ? 'tag-success' : 'tag-danger'">
-                {{ clusterStatus?.leader ? '运行中' : '无主节点' }}
+                {{ clusterStatus?.leader ? '集群正常' : '无主节点' }}
               </span>
             </div>
             <div class="card-body">
-              <div v-if="clusterStatus?.leader" class="info-grid">
-                <div class="info-item">
-                  <span class="info-label">节点名称</span>
-                  <span class="info-value">{{ clusterStatus.leader.name }}</span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">IP 地址</span>
-                  <span class="info-value mono">{{ clusterStatus.leader.ip }}</span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">健康状态</span>
-                  <span class="tag" :class="clusterStatus.leader.is_healthy ? 'tag-success' : 'tag-danger'">
-                    {{ clusterStatus.leader.is_healthy ? '健康' : '异常' }}
-                  </span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">安装状态</span>
-                  <span class="tag" :class="'tag-' + getStatusColor(clusterStatus.leader.install_status)">
-                    {{ clusterStatus.leader.install_status }}
-                  </span>
-                </div>
-                <div class="info-item full-width">
-                  <span class="info-label">操作</span>
-                  <div class="info-value">
-                    <button class="btn btn-sm btn-secondary" @click="restartMySQLNode(clusterStatus.leader)">重启 MySQL</button>
-                  </div>
-                </div>
-              </div>
-              <div v-else class="empty-state">
-                <div class="empty-icon">👑</div>
-                <div class="empty-title">暂无主节点信息</div>
-              </div>
-            </div>
-          </div>
-
-          <div class="card" style="margin-top: 20px;">
-            <div class="card-header">
-              <span class="card-title">🔄 从节点 (Replicas)</span>
-            </div>
-            <div class="card-body">
-              <div class="table-container" v-if="replicaNodes.length > 0">
+              <div class="table-container" v-if="clusterStatus?.nodes && clusterStatus.nodes.length > 0">
                 <table class="table">
                   <thead>
                     <tr>
                       <th>节点名称</th>
                       <th>IP 地址</th>
+                      <th>角色</th>
                       <th>健康状态</th>
                       <th>复制延迟</th>
                       <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="node in replicaNodes" :key="node.node_id">
+                    <tr v-for="node in clusterStatus.nodes" :key="node.node_id">
                       <td>{{ node.name }}</td>
                       <td class="mono">{{ node.ip }}</td>
+                      <td>
+                        <span class="tag" :class="node.node_id === clusterStatus?.leader?.node_id ? 'tag-warning' : 'tag-success'">
+                          {{ node.node_id === clusterStatus?.leader?.node_id ? '主节点' : '从节点' }}
+                        </span>
+                      </td>
                       <td>
                         <span class="tag" :class="node.is_healthy ? 'tag-success' : 'tag-danger'">
                           {{ node.is_healthy ? '健康' : '异常' }}
                         </span>
                       </td>
-                      <td>{{ node.replication_lag !== undefined ? node.replication_lag + 's' : '-' }}</td>
+                      <td>{{ node.node_id === clusterStatus?.leader?.node_id ? '-' : (node.replication_lag !== undefined ? node.replication_lag + 's' : '-') }}</td>
                       <td>
-                        <button class="btn btn-sm btn-primary" :disabled="!node.is_healthy || node.install_status !== 'completed'" @click="showSwitchoverDialog(node)">切换为主</button>
-                        <button class="btn btn-sm btn-secondary" @click="restartMySQLNode(node)" style="margin-left: 8px;">重启</button>
-                        <button class="btn btn-sm btn-secondary" :disabled="node.is_healthy" @click="showRepairNodeDialog(node)" style="margin-left: 8px;">修复</button>
+                        <button 
+                          v-if="node.node_id !== clusterStatus?.leader?.node_id"
+                          class="btn btn-sm btn-primary" 
+                          :disabled="!node.is_healthy || !['completed', 'mysql_installed', 'agent_installed'].includes(node.install_status)" 
+                          @click="showSwitchoverDialog(node)"
+                        >切换为主</button>
+                        <button class="btn btn-sm btn-primary" @click="restartMySQLNode(node)" :style="node.node_id !== clusterStatus?.leader?.node_id ? 'margin-left: 8px;' : ''">重启</button>
+                        <button 
+                          v-if="node.node_id !== clusterStatus?.leader?.node_id"
+                          class="btn btn-sm" 
+                          :class="node.is_healthy ? 'btn-secondary' : 'btn-primary'"
+                          :disabled="node.is_healthy" 
+                          @click="showRepairNodeDialog(node)" 
+                          style="margin-left: 8px;"
+                        >修复</button>
                       </td>
                     </tr>
                   </tbody>
                 </table>
               </div>
               <div v-else class="empty-state">
-                <div class="empty-icon">🔄</div>
-                <div class="empty-title">暂无从节点</div>
+                <div class="empty-icon">🗄️</div>
+                <div class="empty-title">暂无 MySQL 节点信息</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">MySQL 配置信息</span>
+            </div>
+            <div class="card-body">
+              <div class="info-grid">
+                <div class="info-item">
+                  <span class="info-label">MySQL 版本</span>
+                  <span class="info-value">{{ cluster.mysql_version }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">MySQL 端口</span>
+                  <span class="info-value">{{ cluster.settings?.mysql_port || 3306 }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">数据目录</span>
+                  <span class="info-value mono">{{ cluster.data_path }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">安装路径</span>
+                  <span class="info-value mono">{{ cluster.install_path }}</span>
+                </div>
               </div>
             </div>
           </div>
@@ -664,12 +671,6 @@ const etcdNodeCount = computed(() => {
 })
 
 const isClusterHealthy = computed(() => clusterStatus.value?.leader?.is_healthy ?? false)
-
-const replicaNodes = computed(() => {
-  if (!clusterStatus.value) return []
-  const leaderId = clusterStatus.value.leader?.node_id
-  return clusterStatus.value.nodes.filter(node => node.node_id !== leaderId)
-})
 
 const etcdNodes = computed(() => {
   if (!cluster.value) return []

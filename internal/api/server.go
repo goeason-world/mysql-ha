@@ -198,15 +198,19 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 执行 switchover - 请求当前节点成为 leader
-	if err := s.agent.RequestSwitchover(req.Reason); err != nil {
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("switchover failed: %v", err))
-		return
-	}
+	// 异步执行 switchover，立即返回 accepted
+	// 这样可以避免长时间等待导致的 HTTP 超时或 EOF 错误
+	go func() {
+		if err := s.agent.RequestSwitchover(req.Reason); err != nil {
+			if s.logger != nil {
+				s.logger.Error(fmt.Sprintf("switchover failed: %v", err))
+			}
+		}
+	}()
 
 	s.writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":  "accepted",
-		"message": "switchover initiated, this node is now the leader",
+		"message": "switchover initiated, acquiring leadership lock in background",
 	})
 }
 
@@ -222,15 +226,18 @@ func (s *Server) handleDemote(w http.ResponseWriter, r *http.Request) {
 		// Ignore decode error, reason is optional
 	}
 
-	// 执行 demote - 请求当前节点释放 leader 锁
-	if err := s.agent.RequestDemote(req.Reason); err != nil {
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("demote failed: %v", err))
-		return
-	}
+	// 异步执行 demote，立即返回 accepted
+	go func() {
+		if err := s.agent.RequestDemote(req.Reason); err != nil {
+			if s.logger != nil {
+				s.logger.Error(fmt.Sprintf("demote failed: %v", err))
+			}
+		}
+	}()
 
 	s.writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":  "accepted",
-		"message": "demote completed, this node released leadership",
+		"message": "demote initiated, releasing leadership lock in background",
 	})
 }
 
