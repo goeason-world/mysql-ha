@@ -1,1 +1,1 @@
-{"root":["./src/main.ts","./src/vite-env.d.ts","./src/api/index.ts","./src/router/index.ts","./src/app.vue","./src/views/clusterdetail.vue","./src/views/clusterlist.vue","./src/views/createcluster.vue"],"version":"5.6.3"}
+{"root":["./src/main.ts","./src/vite-env.d.ts","./src/api/index.ts","./src/router/index.ts","./src/app.vue","./src/components/backenderror.vue","./src/components/sidebar.vue","./src/components/topheader.vue","./src/views/clusterdetail.vue","./src/views/clusterlist.vue","./src/views/createcluster.vue"],"version":"5.6.3"}

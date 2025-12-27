@@ -28,6 +28,7 @@ type AgentInterface interface {
 	IsLeader() bool
 	RequestSwitchover(reason string) error // 请求成为 leader
 	RequestDemote(reason string) error     // 请求释放 leader 锁
+	RestartMySQL() error                   // 重启 MySQL 服务
 }
 
 // AgentWrapper wraps an agent to implement AgentInterface
@@ -84,6 +85,7 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/nodes/{id}", s.handleGetNode).Methods("GET")
 	api.HandleFunc("/switchover", s.handleSwitchover).Methods("POST")
 	api.HandleFunc("/demote", s.handleDemote).Methods("POST")
+	api.HandleFunc("/restart-mysql", s.handleRestartMySQL).Methods("POST")
 	api.HandleFunc("/history", s.handleGetHistory).Methods("GET")
 
 	// Health check and state (no auth) - used by webadmin
@@ -229,6 +231,19 @@ func (s *Server) handleDemote(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":  "accepted",
 		"message": "demote completed, this node released leadership",
+	})
+}
+
+func (s *Server) handleRestartMySQL(w http.ResponseWriter, r *http.Request) {
+	// 执行 MySQL 重启
+	if err := s.agent.RestartMySQL(); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("restart mysql failed: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":  "accepted",
+		"message": "MySQL restart initiated",
 	})
 }
 

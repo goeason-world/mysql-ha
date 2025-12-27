@@ -48,6 +48,21 @@ export const checkHealth = async (): Promise<boolean> => {
   }
 }
 
+// 版本信息
+export interface VersionInfo {
+  backend_version: string
+  agent_version: string
+}
+
+export const getVersionInfo = async (): Promise<VersionInfo | null> => {
+  try {
+    const response = await axios.get<VersionInfo>('/version', { timeout: 5000 })
+    return response.data
+  } catch {
+    return null
+  }
+}
+
 // 类型定义
 export interface Host {
   id?: string
@@ -147,15 +162,36 @@ export interface ClusterStatus {
 export const getClusterStatus = (id: string) =>
   api.get<ClusterStatus>(`/clusters/${id}/status`)
 
+// etcd 状态
+export interface EtcdNodeStatus {
+  ip: string
+  name: string
+  is_healthy: boolean
+  is_leader: boolean
+}
+
+export const getEtcdStatus = (id: string) =>
+  api.get<{ nodes: EtcdNodeStatus[] }>(`/clusters/${id}/etcd-status`)
+
 export const switchover = (id: string, targetNodeId: string, reason?: string) =>
   api.post(`/clusters/${id}/switchover`, { target_node_id: targetNodeId, reason })
 
 // Agent 管理
-export const upgradeAgents = (id: string, nodeIds: string[]) =>
-  api.post(`/clusters/${id}/upgrade-agents`, { node_ids: nodeIds })
+export interface UpgradeResult {
+  status: string
+  message: string
+  current_version?: string
+}
+
+export const upgradeAgents = (id: string, nodeIds: string[], force: boolean = false) =>
+  api.post<UpgradeResult>(`/clusters/${id}/upgrade-agents`, { node_ids: nodeIds, force })
 
 export const restartAgents = (id: string, nodeIds: string[]) =>
   api.post(`/clusters/${id}/restart-agents`, { node_ids: nodeIds })
+
+// MySQL 服务管理
+export const restartMySQL = (id: string, nodeIds: string[]) =>
+  api.post(`/clusters/${id}/restart-mysql`, { node_ids: nodeIds })
 
 // 日志
 export interface LogEntry {
@@ -169,7 +205,14 @@ export const getAgentLogs = (id: string, nodeId?: string) =>
   api.get<{ logs: LogEntry[] }>(`/clusters/${id}/logs`, { params: { node_id: nodeId } })
 
 // 一键修复主从
+export interface RepairResult {
+  status: 'healthy' | 'started'
+  message: string
+  master?: string
+  master_ip?: string
+}
+
 export const repairReplication = (id: string) =>
-  api.post(`/clusters/${id}/repair-replication`)
+  api.post<RepairResult>(`/clusters/${id}/repair-replication`)
 
 export default api

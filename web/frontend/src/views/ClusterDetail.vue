@@ -1,267 +1,414 @@
 <template>
-  <div class="cluster-detail-layout">
+  <div class="cluster-detail-page">
     <!-- 左侧菜单 -->
-    <div class="sidebar">
+    <aside class="detail-sidebar">
       <div class="sidebar-header">
-        <el-icon><DataBoard /></el-icon>
-        <span>{{ cluster?.name || '集群管理' }}</span>
+        <div class="cluster-badge">🗄️</div>
+        <div class="cluster-title">
+          <span class="name">{{ cluster?.name || '集群管理' }}</span>
+          <span class="id">{{ cluster?.id?.slice(0, 8) }}</span>
+        </div>
       </div>
-      <el-menu :default-active="activeMenu" class="sidebar-menu" @select="handleMenuSelect">
-        <el-menu-item index="overview">
-          <el-icon><House /></el-icon>
+      
+      <nav class="sidebar-nav">
+        <div class="nav-item" :class="{ active: activeMenu === 'overview' }" @click="activeMenu = 'overview'">
+          <span class="nav-icon">📊</span>
           <span>集群概览</span>
-        </el-menu-item>
-        <el-menu-item index="mysql">
-          <el-icon><Coin /></el-icon>
+        </div>
+        <div class="nav-item" :class="{ active: activeMenu === 'mysql' }" @click="activeMenu = 'mysql'">
+          <span class="nav-icon">🗄️</span>
           <span>MySQL 控制</span>
-        </el-menu-item>
-        <el-menu-item index="etcd">
-          <el-icon><Connection /></el-icon>
+        </div>
+        <div class="nav-item" :class="{ active: activeMenu === 'etcd' }" @click="activeMenu = 'etcd'">
+          <span class="nav-icon">🔗</span>
           <span>etcd 控制</span>
-        </el-menu-item>
-        <el-menu-item index="agent">
-          <el-icon><Monitor /></el-icon>
-          <span>HA Agent 控制</span>
-        </el-menu-item>
-        <el-menu-item index="logs">
-          <el-icon><Document /></el-icon>
+        </div>
+        <div class="nav-item" :class="{ active: activeMenu === 'agent' }" @click="activeMenu = 'agent'">
+          <span class="nav-icon">🤖</span>
+          <span>HA Agent</span>
+        </div>
+        <div class="nav-item" :class="{ active: activeMenu === 'logs' }" @click="activeMenu = 'logs'">
+          <span class="nav-icon">📋</span>
           <span>实时日志</span>
-        </el-menu-item>
-        <el-menu-item index="install">
-          <el-icon><Download /></el-icon>
+        </div>
+        <div class="nav-item" :class="{ active: activeMenu === 'install' }" @click="activeMenu = 'install'">
+          <span class="nav-icon">📦</span>
           <span>安装状态</span>
-        </el-menu-item>
-      </el-menu>
+        </div>
+      </nav>
+      
       <div class="sidebar-footer">
-        <el-button text @click="router.push('/clusters')">
-          <el-icon><Back /></el-icon>
-          返回列表
-        </el-button>
+        <button class="back-btn" @click="router.push('/clusters')">
+          <span>←</span>
+          <span>返回列表</span>
+        </button>
       </div>
-    </div>
+    </aside>
 
-    <!-- 右侧内容区 -->
-    <div class="main-content">
-      <el-card v-if="loading" class="content-card">
-        <div class="loading"><el-icon class="is-loading"><Loading /></el-icon> 加载中...</div>
-      </el-card>
+    <!-- 主内容区 -->
+    <main class="detail-content">
+      <div v-if="loading" class="loading">
+        <div class="spinner"></div>
+        <span>加载中...</span>
+      </div>
 
       <template v-else-if="cluster">
         <!-- 集群概览 -->
-        <div v-show="activeMenu === 'overview'" class="content-section">
-          <h2 class="section-title">📊 集群概览</h2>
-          <el-row :gutter="20">
-            <el-col :span="6">
-              <el-card class="stat-card">
-                <div class="stat-icon mysql-icon"><el-icon><Coin /></el-icon></div>
-                <div class="stat-info">
-                  <div class="stat-value">{{ mysqlNodeCount }}</div>
-                  <div class="stat-label">MySQL 节点</div>
+        <section v-show="activeMenu === 'overview'" class="content-section">
+          <div class="section-header">
+            <h2>📊 集群概览</h2>
+          </div>
+          
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-icon primary">🗄️</div>
+              <div class="stat-content">
+                <div class="stat-value">{{ mysqlNodeCount }}</div>
+                <div class="stat-label">MySQL 节点</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon info">🔗</div>
+              <div class="stat-content">
+                <div class="stat-value">{{ etcdNodeCount }}</div>
+                <div class="stat-label">etcd 节点</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon warning">🤖</div>
+              <div class="stat-content">
+                <div class="stat-value">{{ agentHealthyCount }}/{{ mysqlNodeCount }}</div>
+                <div class="stat-label">Agent 在线</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon" :class="isClusterHealthy ? 'success' : 'danger'">
+                {{ isClusterHealthy ? '✅' : '❌' }}
+              </div>
+              <div class="stat-content">
+                <div class="stat-value">{{ isClusterHealthy ? '正常' : '异常' }}</div>
+                <div class="stat-label">集群状态</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">基本信息</span>
+            </div>
+            <div class="card-body">
+              <div class="info-grid">
+                <div class="info-item">
+                  <span class="info-label">集群ID</span>
+                  <span class="info-value mono">{{ cluster.id }}</span>
                 </div>
-              </el-card>
-            </el-col>
-            <el-col :span="6">
-              <el-card class="stat-card">
-                <div class="stat-icon etcd-icon"><el-icon><Connection /></el-icon></div>
-                <div class="stat-info">
-                  <div class="stat-value">{{ etcdNodeCount }}</div>
-                  <div class="stat-label">etcd 节点</div>
+                <div class="info-item">
+                  <span class="info-label">集群名称</span>
+                  <span class="info-value">{{ cluster.name }}</span>
                 </div>
-              </el-card>
-            </el-col>
-            <el-col :span="6">
-              <el-card class="stat-card">
-                <div class="stat-icon agent-icon"><el-icon><Monitor /></el-icon></div>
-                <div class="stat-info">
-                  <div class="stat-value">{{ agentHealthyCount }}/{{ mysqlNodeCount }}</div>
-                  <div class="stat-label">Agent 在线</div>
+                <div class="info-item">
+                  <span class="info-label">MySQL 版本</span>
+                  <span class="info-value">{{ cluster.mysql_version }}</span>
                 </div>
-              </el-card>
-            </el-col>
-            <el-col :span="6">
-              <el-card class="stat-card">
-                <div class="stat-icon status-icon" :class="{ healthy: isClusterHealthy }">
-                  <el-icon><CircleCheck /></el-icon>
+                <div class="info-item">
+                  <span class="info-label">etcd 版本</span>
+                  <span class="info-value">{{ cluster.etcd_version }}</span>
                 </div>
-                <div class="stat-info">
-                  <div class="stat-value">{{ isClusterHealthy ? '正常' : '异常' }}</div>
-                  <div class="stat-label">集群状态</div>
+                <div class="info-item">
+                  <span class="info-label">安装路径</span>
+                  <span class="info-value mono">{{ cluster.install_path }}</span>
                 </div>
-              </el-card>
-            </el-col>
-          </el-row>
-          <el-card class="info-card" style="margin-top: 20px;">
-            <template #header><span>基本信息</span></template>
-            <el-descriptions :column="2" border>
-              <el-descriptions-item label="集群ID">{{ cluster.id }}</el-descriptions-item>
-              <el-descriptions-item label="集群名称">{{ cluster.name }}</el-descriptions-item>
-              <el-descriptions-item label="MySQL 版本">{{ cluster.mysql_version }}</el-descriptions-item>
-              <el-descriptions-item label="etcd 版本">{{ cluster.etcd_version }}</el-descriptions-item>
-              <el-descriptions-item label="安装路径">{{ cluster.install_path }}</el-descriptions-item>
-              <el-descriptions-item label="数据目录">{{ cluster.data_path }}</el-descriptions-item>
-              <el-descriptions-item label="MySQL 端口">{{ cluster.settings?.mysql_port }}</el-descriptions-item>
-              <el-descriptions-item label="HA Agent 端口">{{ cluster.settings?.ha_agent_port }}</el-descriptions-item>
-            </el-descriptions>
-          </el-card>
-        </div>
+                <div class="info-item">
+                  <span class="info-label">数据目录</span>
+                  <span class="info-value mono">{{ cluster.data_path }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">MySQL 端口</span>
+                  <span class="info-value">{{ cluster.settings?.mysql_port }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">HA Agent 端口</span>
+                  <span class="info-value">{{ cluster.settings?.ha_agent_port }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- MySQL 控制 -->
-        <div v-show="activeMenu === 'mysql'" class="content-section">
+        <section v-show="activeMenu === 'mysql'" class="content-section">
           <div class="section-header">
-            <h2 class="section-title">🗄️ MySQL 集群控制</h2>
-            <div>
-              <el-button @click="refreshMySQLStatus" :loading="refreshing" type="primary">
-                <el-icon><Refresh /></el-icon> 刷新状态
-              </el-button>
-              <el-button @click="showRepairDialog" type="danger" style="margin-left: 10px;">
-                <el-icon><WarnTriangleFilled /></el-icon> 一键修复主从
-              </el-button>
+            <h2>🗄️ MySQL 集群控制</h2>
+            <div class="header-actions">
+              <label class="auto-refresh-toggle">
+                <input type="checkbox" v-model="autoRefreshMySQL" />
+                <span>自动刷新</span>
+              </label>
+              <button class="btn btn-danger" @click="showRepairDialog">
+                ⚠️ 一键修复主从
+              </button>
             </div>
           </div>
-          <el-card class="control-card">
-            <template #header>
-              <div class="card-header">
-                <span>👑 主节点 (Leader)</span>
-                <el-tag v-if="clusterStatus?.leader" type="success">运行中</el-tag>
-                <el-tag v-else type="danger">无主节点</el-tag>
-              </div>
-            </template>
-            <div v-if="clusterStatus?.leader" class="node-detail">
-              <el-descriptions :column="2" border>
-                <el-descriptions-item label="节点名称">{{ clusterStatus.leader.name }}</el-descriptions-item>
-                <el-descriptions-item label="IP 地址">{{ clusterStatus.leader.ip }}</el-descriptions-item>
-                <el-descriptions-item label="健康状态">
-                  <el-tag :type="clusterStatus.leader.is_healthy ? 'success' : 'danger'">
-                    {{ clusterStatus.leader.is_healthy ? '健康' : '异常' }}
-                  </el-tag>
-                </el-descriptions-item>
-                <el-descriptions-item label="安装状态">
-                  <el-tag :type="getStatusType(clusterStatus.leader.install_status)">{{ clusterStatus.leader.install_status }}</el-tag>
-                </el-descriptions-item>
-              </el-descriptions>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">👑 主节点 (Leader)</span>
+              <span class="tag" :class="clusterStatus?.leader ? 'tag-success' : 'tag-danger'">
+                {{ clusterStatus?.leader ? '运行中' : '无主节点' }}
+              </span>
             </div>
-            <el-empty v-else description="暂无主节点信息" />
-          </el-card>
-          <el-card class="control-card" style="margin-top: 20px;">
-            <template #header><span>🔄 从节点 (Replicas)</span></template>
-            <el-table :data="replicaNodes" style="width: 100%">
-              <el-table-column prop="name" label="节点名称" />
-              <el-table-column prop="ip" label="IP 地址" />
-              <el-table-column label="健康状态">
-                <template #default="{ row }">
-                  <el-tag :type="row.is_healthy ? 'success' : 'danger'">{{ row.is_healthy ? '健康' : '异常' }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="复制延迟">
-                <template #default="{ row }">{{ row.replication_lag !== undefined ? row.replication_lag + 's' : '-' }}</template>
-              </el-table-column>
-              <el-table-column label="操作" width="220">
-                <template #default="{ row }">
-                  <el-button size="small" type="primary" :disabled="!row.is_healthy || row.install_status !== 'completed'" @click="showSwitchoverDialog(row)">切换为主</el-button>
-                  <el-button size="small" type="warning" :disabled="row.is_healthy" @click="showRepairNodeDialog(row)">修复</el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-            <el-empty v-if="replicaNodes.length === 0" description="暂无从节点" />
-          </el-card>
-        </div>
+            <div class="card-body">
+              <div v-if="clusterStatus?.leader" class="info-grid">
+                <div class="info-item">
+                  <span class="info-label">节点名称</span>
+                  <span class="info-value">{{ clusterStatus.leader.name }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">IP 地址</span>
+                  <span class="info-value mono">{{ clusterStatus.leader.ip }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">健康状态</span>
+                  <span class="tag" :class="clusterStatus.leader.is_healthy ? 'tag-success' : 'tag-danger'">
+                    {{ clusterStatus.leader.is_healthy ? '健康' : '异常' }}
+                  </span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">安装状态</span>
+                  <span class="tag" :class="'tag-' + getStatusColor(clusterStatus.leader.install_status)">
+                    {{ clusterStatus.leader.install_status }}
+                  </span>
+                </div>
+                <div class="info-item full-width">
+                  <span class="info-label">操作</span>
+                  <div class="info-value">
+                    <button class="btn btn-sm btn-secondary" @click="restartMySQLNode(clusterStatus.leader)">重启 MySQL</button>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="empty-state">
+                <div class="empty-icon">👑</div>
+                <div class="empty-title">暂无主节点信息</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">🔄 从节点 (Replicas)</span>
+            </div>
+            <div class="card-body">
+              <div class="table-container" v-if="replicaNodes.length > 0">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>节点名称</th>
+                      <th>IP 地址</th>
+                      <th>健康状态</th>
+                      <th>复制延迟</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="node in replicaNodes" :key="node.node_id">
+                      <td>{{ node.name }}</td>
+                      <td class="mono">{{ node.ip }}</td>
+                      <td>
+                        <span class="tag" :class="node.is_healthy ? 'tag-success' : 'tag-danger'">
+                          {{ node.is_healthy ? '健康' : '异常' }}
+                        </span>
+                      </td>
+                      <td>{{ node.replication_lag !== undefined ? node.replication_lag + 's' : '-' }}</td>
+                      <td>
+                        <button class="btn btn-sm btn-primary" :disabled="!node.is_healthy || node.install_status !== 'completed'" @click="showSwitchoverDialog(node)">切换为主</button>
+                        <button class="btn btn-sm btn-secondary" @click="restartMySQLNode(node)" style="margin-left: 8px;">重启</button>
+                        <button class="btn btn-sm btn-secondary" :disabled="node.is_healthy" @click="showRepairNodeDialog(node)" style="margin-left: 8px;">修复</button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div v-else class="empty-state">
+                <div class="empty-icon">🔄</div>
+                <div class="empty-title">暂无从节点</div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- etcd 控制 -->
-        <div v-show="activeMenu === 'etcd'" class="content-section">
+        <section v-show="activeMenu === 'etcd'" class="content-section">
           <div class="section-header">
-            <h2 class="section-title">🔗 etcd 集群控制</h2>
-            <el-button @click="refreshEtcdStatus" :loading="refreshingEtcd" type="primary">
-              <el-icon><Refresh /></el-icon> 刷新状态
-            </el-button>
+            <h2>🔗 etcd 集群控制</h2>
+            <div class="header-actions">
+              <button class="btn btn-primary" @click="refreshEtcdStatus" :disabled="refreshingEtcd">
+                🔄 刷新状态
+              </button>
+            </div>
           </div>
-          <el-card class="control-card">
-            <template #header><span>etcd 节点列表</span></template>
-            <el-table :data="etcdNodes" style="width: 100%">
-              <el-table-column prop="name" label="节点名称" />
-              <el-table-column prop="ip" label="IP 地址" />
-              <el-table-column label="客户端端口"><template #default="{ row }">{{ row.ip }}:2379</template></el-table-column>
-              <el-table-column label="Peer 端口"><template #default="{ row }">{{ row.ip }}:2380</template></el-table-column>
-              <el-table-column label="安装状态">
-                <template #default="{ row }"><el-tag :type="getStatusType(row.status)">{{ row.status }}</el-tag></template>
-              </el-table-column>
-            </el-table>
-          </el-card>
-          <el-card class="control-card" style="margin-top: 20px;">
-            <template #header><span>etcd 集群信息</span></template>
-            <el-descriptions :column="1" border>
-              <el-descriptions-item label="集群端点">
-                <el-tag v-for="node in etcdNodes" :key="node.id" style="margin-right: 8px;">http://{{ node.ip }}:2379</el-tag>
-              </el-descriptions-item>
-              <el-descriptions-item label="集群 Token">mysql-ha-etcd-cluster</el-descriptions-item>
-            </el-descriptions>
-          </el-card>
-        </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">etcd 节点列表</span>
+            </div>
+            <div class="card-body">
+              <div class="table-container">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>节点名称</th>
+                      <th>IP 地址</th>
+                      <th>客户端端口</th>
+                      <th>Peer 端口</th>
+                      <th>健康状态</th>
+                      <th>安装状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="node in etcdNodesWithHealth" :key="node.id">
+                      <td>{{ node.name }}</td>
+                      <td class="mono">{{ node.ip }}</td>
+                      <td class="mono">{{ node.ip }}:2379</td>
+                      <td class="mono">{{ node.ip }}:2380</td>
+                      <td>
+                        <span class="tag" :class="node.is_healthy ? 'tag-success' : 'tag-danger'">
+                          {{ node.is_healthy ? '健康' : '异常' }}
+                        </span>
+                      </td>
+                      <td>
+                        <span class="tag" :class="'tag-' + getStatusColor(node.status)">{{ node.status }}</span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">etcd 集群信息</span>
+            </div>
+            <div class="card-body">
+              <div class="info-grid">
+                <div class="info-item full-width">
+                  <span class="info-label">集群端点</span>
+                  <div class="info-value">
+                    <span class="tag tag-info" v-for="node in etcdNodes" :key="node.id" style="margin-right: 8px;">
+                      http://{{ node.ip }}:2379
+                    </span>
+                  </div>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">集群 Token</span>
+                  <span class="info-value mono">mysql-ha-etcd-cluster</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- HA Agent 控制 -->
-        <div v-show="activeMenu === 'agent'" class="content-section">
+        <section v-show="activeMenu === 'agent'" class="content-section">
           <div class="section-header">
-            <h2 class="section-title">🤖 HA Agent 控制</h2>
-            <div>
-              <el-button @click="refreshAgentStatus" :loading="refreshingAgent" type="primary">
-                <el-icon><Refresh /></el-icon> 刷新状态
-              </el-button>
-              <el-button @click="showUpgradeDialog" type="warning" style="margin-left: 10px;">
-                <el-icon><Upload /></el-icon> 批量更新 Agent
-              </el-button>
+            <h2>🤖 HA Agent 控制</h2>
+            <div class="header-actions">
+              <button class="btn btn-primary" @click="refreshAgentStatus" :disabled="refreshingAgent">
+                🔄 刷新状态
+              </button>
+              <button class="btn btn-secondary" @click="showUpgradeDialog">
+                ⬆️ 批量更新
+              </button>
             </div>
           </div>
-          <el-card class="control-card">
-            <template #header><span>Agent 节点状态</span></template>
-            <el-table :data="agentNodes" style="width: 100%">
-              <el-table-column prop="name" label="节点名称" />
-              <el-table-column prop="ip" label="IP 地址" />
-              <el-table-column label="Agent 状态">
-                <template #default="{ row }">
-                  <el-tag :type="row.is_healthy ? 'success' : 'danger'">{{ row.is_healthy ? '运行中' : '离线' }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="版本">
-                <template #default="{ row }">{{ row.agent_version || '-' }}</template>
-              </el-table-column>
-              <el-table-column label="API 端口">
-                <template #default>{{ cluster.settings?.ha_agent_port || 8080 }}</template>
-              </el-table-column>
-              <el-table-column label="操作" width="200">
-                <template #default="{ row }">
-                  <el-button size="small" type="primary" @click="restartAgent(row)">重启</el-button>
-                  <el-button size="small" type="warning" @click="upgradeAgent(row)">更新</el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
-          <el-card class="control-card" style="margin-top: 20px;">
-            <template #header><span>Agent 配置信息</span></template>
-            <el-descriptions :column="2" border>
-              <el-descriptions-item label="配置文件路径">/etc/mypatroni/config.yaml</el-descriptions-item>
-              <el-descriptions-item label="日志文件路径">/var/log/mypatroni/mypatroni.log</el-descriptions-item>
-              <el-descriptions-item label="TTL">{{ cluster.settings?.ha_agent_port ? '30s' : '-' }}</el-descriptions-item>
-              <el-descriptions-item label="Loop Wait">10s</el-descriptions-item>
-            </el-descriptions>
-          </el-card>
-        </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Agent 节点状态</span>
+            </div>
+            <div class="card-body">
+              <div class="table-container">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>节点名称</th>
+                      <th>IP 地址</th>
+                      <th>Agent 状态</th>
+                      <th>版本</th>
+                      <th>API 端口</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="node in agentNodes" :key="node.node_id">
+                      <td>{{ node.name }}</td>
+                      <td class="mono">{{ node.ip }}</td>
+                      <td>
+                        <span class="tag" :class="node.is_healthy ? 'tag-success' : 'tag-danger'">
+                          {{ node.is_healthy ? '运行中' : '离线' }}
+                        </span>
+                      </td>
+                      <td>{{ node.agent_version || '-' }}</td>
+                      <td>{{ cluster.settings?.ha_agent_port || 8080 }}</td>
+                      <td>
+                        <button class="btn btn-sm btn-primary" @click="restartAgent(node)">重启</button>
+                        <button class="btn btn-sm btn-secondary" @click="upgradeAgent(node)" style="margin-left: 8px;">更新</button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">Agent 配置信息</span>
+            </div>
+            <div class="card-body">
+              <div class="info-grid">
+                <div class="info-item">
+                  <span class="info-label">配置文件路径</span>
+                  <span class="info-value mono">/etc/mypatroni/config.yaml</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">日志文件路径</span>
+                  <span class="info-value mono">/var/log/mypatroni/mypatroni.log</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">TTL</span>
+                  <span class="info-value">30s</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-label">Loop Wait</span>
+                  <span class="info-value">10s</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- 实时日志 -->
-        <div v-show="activeMenu === 'logs'" class="content-section">
+        <section v-show="activeMenu === 'logs'" class="content-section">
           <div class="section-header">
-            <h2 class="section-title">📋 实时日志</h2>
-            <div>
-              <el-select v-model="logSource" style="width: 150px; margin-right: 10px;">
-                <el-option label="全部节点" value="all" />
-                <el-option v-for="node in agentNodes" :key="node.node_id" :label="node.name" :value="node.node_id" />
-              </el-select>
-              <el-button @click="fetchLogs" :loading="fetchingLogs" type="primary">
-                <el-icon><Refresh /></el-icon> 刷新日志
-              </el-button>
-              <el-button @click="clearLogs" type="info">清空</el-button>
-              <el-switch v-model="autoRefreshLogs" active-text="自动刷新" style="margin-left: 15px;" />
+            <h2>📋 实时日志</h2>
+            <div class="header-actions">
+              <select v-model="logSource" class="form-select" style="width: 150px;">
+                <option value="all">全部节点</option>
+                <option v-for="node in agentNodes" :key="node.node_id" :value="node.node_id">{{ node.name }}</option>
+              </select>
+              <button class="btn btn-primary" @click="fetchLogs" :disabled="fetchingLogs">
+                🔄 刷新日志
+              </button>
+              <button class="btn btn-secondary" @click="clearLogs">清空</button>
+              <label class="auto-refresh-toggle">
+                <input type="checkbox" v-model="autoRefreshLogs" />
+                <span>自动刷新</span>
+              </label>
             </div>
           </div>
-          <el-card class="control-card log-card">
+
+          <div class="card log-card">
             <div class="log-container" ref="logContainer">
               <div v-for="(log, index) in logs" :key="index" class="log-line" :class="getLogClass(log)">
                 <span class="log-time">{{ log.time }}</span>
@@ -271,176 +418,185 @@
               </div>
               <div v-if="logs.length === 0" class="log-empty">暂无日志，点击刷新获取</div>
             </div>
-          </el-card>
-        </div>
+          </div>
+        </section>
 
         <!-- 安装状态 -->
-        <div v-show="activeMenu === 'install'" class="content-section">
+        <section v-show="activeMenu === 'install'" class="content-section">
           <div class="section-header">
-            <h2 class="section-title">📦 安装状态</h2>
-            <div>
-              <el-button @click="refreshInstallStatus" :loading="refreshingInstall" type="primary">
-                <el-icon><Refresh /></el-icon> 刷新状态
-              </el-button>
-              <el-button @click="showRetryDialog" type="warning" style="margin-left: 10px;" :disabled="!hasFailedNodes">
-                <el-icon><RefreshRight /></el-icon> 重试安装
-              </el-button>
+            <h2>📦 安装状态</h2>
+            <div class="header-actions">
+              <button class="btn btn-primary" @click="refreshInstallStatus" :disabled="refreshingInstall">
+                🔄 刷新状态
+              </button>
+              <button class="btn btn-secondary" @click="showRetryDialog" :disabled="!hasFailedNodes">
+                🔁 重试安装
+              </button>
             </div>
           </div>
-          <el-card class="control-card">
-            <template #header>
-              <div class="card-header">
-                <span>节点安装进度</span>
-                <el-tag :type="getPhaseType(cluster.phase)">{{ getPhaseText(cluster.phase) }}</el-tag>
-              </div>
-            </template>
-            <el-table :data="cluster.hosts" style="width: 100%">
-              <el-table-column prop="name" label="节点名称" />
-              <el-table-column prop="ip" label="IP 地址" />
-              <el-table-column label="角色">
-                <template #default="{ row }">
-                  <el-tag v-for="role in row.roles" :key="role" :type="getRoleType(role)" style="margin-right: 4px;">{{ role }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="安装状态">
-                <template #default="{ row }"><el-tag :type="getStatusType(row.status)">{{ row.status || 'pending' }}</el-tag></template>
-              </el-table-column>
-              <el-table-column label="操作" width="120">
-                <template #default="{ row }">
-                  <el-button size="small" type="warning" v-if="row.status !== 'completed'" @click="retryNodeInstall(row)">重试</el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
-        </div>
-      </template>
-    </div>
 
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">节点安装进度</span>
+              <span class="tag" :class="'tag-' + getPhaseColor(cluster.phase)">{{ getPhaseText(cluster.phase) }}</span>
+            </div>
+            <div class="card-body">
+              <div class="table-container">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>节点名称</th>
+                      <th>IP 地址</th>
+                      <th>角色</th>
+                      <th>安装状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="host in cluster.hosts" :key="host.id">
+                      <td>{{ host.name }}</td>
+                      <td class="mono">{{ host.ip }}</td>
+                      <td>
+                        <span v-for="role in host.roles" :key="role" class="tag" :class="'tag-' + getRoleColor(role)" style="margin-right: 4px;">
+                          {{ role }}
+                        </span>
+                      </td>
+                      <td>
+                        <span class="tag" :class="'tag-' + getStatusColor(host.status)">{{ host.status || 'pending' }}</span>
+                      </td>
+                      <td>
+                        <button class="btn btn-sm btn-secondary" v-if="host.status !== 'completed'" @click="retryNodeInstall(host)">重试</button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </template>
+    </main>
+
+    <!-- 对话框 -->
     <!-- 重试安装对话框 -->
     <el-dialog v-model="retryDialogVisible" title="重试安装" width="550px">
-      <el-alert type="info" :closable="false" style="margin-bottom: 20px;">
+      <div class="dialog-alert">
         <p>选择要重试安装的节点和阶段：</p>
-        <ul style="margin: 10px 0; padding-left: 20px;">
+        <ul>
           <li>如果下载文件已存在且完整，将跳过下载直接解压</li>
           <li>已完成的节点不会被重复安装</li>
         </ul>
-      </el-alert>
-      <el-form label-width="100px">
-        <el-form-item label="选择节点">
-          <el-checkbox-group v-model="retryTargets">
-            <el-checkbox v-for="host in failedHosts" :key="host.id" :label="host.id">
-              {{ host.name }} ({{ host.ip }}) - {{ host.status || 'pending' }}
-            </el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-        <el-form-item label="重试阶段">
-          <el-select v-model="retryPhase" placeholder="自动检测">
-            <el-option label="自动检测" value="" />
-            <el-option label="etcd" value="etcd" />
-            <el-option label="MySQL" value="mysql" />
-            <el-option label="HA Agent" value="agent" />
-          </el-select>
-        </el-form-item>
-      </el-form>
+      </div>
+      <div class="form-group">
+        <label class="form-label">选择节点</label>
+        <div class="checkbox-group">
+          <label v-for="host in failedHosts" :key="host.id" class="checkbox-item">
+            <input type="checkbox" :value="host.id" v-model="retryTargets" />
+            <span>{{ host.name }} ({{ host.ip }}) - {{ host.status || 'pending' }}</span>
+          </label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">重试阶段</label>
+        <select v-model="retryPhase" class="form-select">
+          <option value="">自动检测</option>
+          <option value="etcd">etcd</option>
+          <option value="mysql">MySQL</option>
+          <option value="agent">HA Agent</option>
+        </select>
+      </div>
       <template #footer>
-        <el-button @click="retryDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="performRetryInstall" :loading="retryLoading" :disabled="retryTargets.length === 0">
+        <button class="btn btn-secondary" @click="retryDialogVisible = false">取消</button>
+        <button class="btn btn-primary" @click="performRetryInstall" :disabled="retryLoading || retryTargets.length === 0">
           开始重试 ({{ retryTargets.length }} 个节点)
-        </el-button>
+        </button>
       </template>
     </el-dialog>
 
     <!-- Switchover 确认对话框 -->
     <el-dialog v-model="switchoverDialogVisible" title="主从切换确认" width="500px">
-      <div v-if="selectedNode">
-        <el-alert type="warning" :closable="false" style="margin-bottom: 20px;">
-          <p>您即将执行主从切换操作，这将会：</p>
-          <ul style="margin: 10px 0; padding-left: 20px;">
-            <li>将当前主节点切换为从节点</li>
-            <li>将 <strong>{{ selectedNode.name }}</strong> 提升为新的主节点</li>
-            <li>可能会有短暂的服务中断</li>
-          </ul>
-        </el-alert>
+      <div v-if="selectedNode" class="dialog-alert warning">
+        <p>您即将执行主从切换操作，这将会：</p>
+        <ul>
+          <li>将当前主节点切换为从节点</li>
+          <li>将 <strong>{{ selectedNode.name }}</strong> 提升为新的主节点</li>
+          <li>可能会有短暂的服务中断</li>
+        </ul>
       </div>
       <template #footer>
-        <el-button @click="switchoverDialogVisible = false">取消</el-button>
-        <el-button type="danger" @click="confirmSwitchover" :loading="switchoverLoading">确认切换</el-button>
+        <button class="btn btn-secondary" @click="switchoverDialogVisible = false">取消</button>
+        <button class="btn btn-danger" @click="confirmSwitchover" :disabled="switchoverLoading">确认切换</button>
       </template>
     </el-dialog>
 
     <!-- Agent 批量更新对话框 -->
     <el-dialog v-model="upgradeDialogVisible" title="批量更新 HA Agent" width="600px">
-      <el-alert type="info" :closable="false" style="margin-bottom: 20px;">
+      <div class="dialog-alert">
         将使用本地的 mypatroni 二进制文件更新所有节点的 HA Agent。更新过程中 Agent 会短暂重启。
-      </el-alert>
-      <el-form label-width="100px">
-        <el-form-item label="选择节点">
-          <el-checkbox-group v-model="upgradeTargets">
-            <el-checkbox v-for="node in agentNodes" :key="node.node_id" :label="node.node_id">
-              {{ node.name }} ({{ node.ip }})
-            </el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-      </el-form>
+      </div>
+      <div class="form-group">
+        <label class="form-label">选择节点</label>
+        <div class="checkbox-group">
+          <label v-for="node in agentNodes" :key="node.node_id" class="checkbox-item">
+            <input type="checkbox" :value="node.node_id" v-model="upgradeTargets" />
+            <span>{{ node.name }} ({{ node.ip }})</span>
+          </label>
+        </div>
+      </div>
       <template #footer>
-        <el-button @click="upgradeDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="performBatchUpgrade" :loading="upgradeLoading" :disabled="upgradeTargets.length === 0">
+        <button class="btn btn-secondary" @click="upgradeDialogVisible = false">取消</button>
+        <button class="btn btn-primary" @click="performBatchUpgrade" :disabled="upgradeLoading || upgradeTargets.length === 0">
           开始更新 ({{ upgradeTargets.length }} 个节点)
-        </el-button>
+        </button>
       </template>
     </el-dialog>
 
     <!-- 一键修复主从对话框 -->
     <el-dialog v-model="repairDialogVisible" title="一键修复主从" width="550px">
-      <el-alert type="warning" :closable="false" style="margin-bottom: 20px;">
+      <div class="dialog-alert warning">
         <p><strong>此操作将执行以下步骤：</strong></p>
-        <ul style="margin: 10px 0; padding-left: 20px;">
+        <ul>
           <li>检测所有 MySQL 节点的实际状态（read_only、复制配置）</li>
           <li>自动识别真正的主节点（非只读且无复制配置的节点）</li>
           <li>更新 etcd 中的 leader_info 为实际主节点</li>
           <li>重新配置所有从节点的复制指向正确的主节点</li>
         </ul>
-        <p style="color: #E6A23C; margin-top: 10px;">⚠️ 此操作会短暂中断复制，请在业务低峰期执行</p>
-      </el-alert>
+        <p class="warning-text">⚠️ 此操作会短暂中断复制，请在业务低峰期执行</p>
+      </div>
       <template #footer>
-        <el-button @click="repairDialogVisible = false">取消</el-button>
-        <el-button type="danger" @click="confirmRepair" :loading="repairLoading">确认修复</el-button>
+        <button class="btn btn-secondary" @click="repairDialogVisible = false">取消</button>
+        <button class="btn btn-danger" @click="confirmRepair" :disabled="repairLoading">确认修复</button>
       </template>
     </el-dialog>
 
     <!-- 单节点修复对话框 -->
     <el-dialog v-model="repairNodeDialogVisible" title="修复异常节点" width="550px">
-      <div v-if="selectedRepairNode">
-        <el-alert type="info" :closable="false" style="margin-bottom: 20px;">
-          <p><strong>将对节点 {{ selectedRepairNode.name }} ({{ selectedRepairNode.ip }}) 执行以下修复操作：</strong></p>
-          <ul style="margin: 10px 0; padding-left: 20px;">
-            <li>检查并启动 MySQL 服务（如果未运行）</li>
-            <li>检查并启动 mypatroni HA Agent 服务（如果未运行）</li>
-            <li>自动查找当前集群的主节点</li>
-            <li>配置该节点为从节点，复制指向主节点</li>
-            <li>设置为只读模式</li>
-          </ul>
-          <p style="color: #409EFF; margin-top: 10px;">💡 修复过程约需 15-30 秒，请耐心等待</p>
-        </el-alert>
+      <div v-if="selectedRepairNode" class="dialog-alert">
+        <p><strong>将对节点 {{ selectedRepairNode.name }} ({{ selectedRepairNode.ip }}) 执行以下修复操作：</strong></p>
+        <ul>
+          <li>检查并启动 MySQL 服务（如果未运行）</li>
+          <li>检查并启动 mypatroni HA Agent 服务（如果未运行）</li>
+          <li>自动查找当前集群的主节点</li>
+          <li>配置该节点为从节点，复制指向主节点</li>
+          <li>设置为只读模式</li>
+        </ul>
+        <p class="info-text">💡 修复过程约需 15-30 秒，请耐心等待</p>
       </div>
       <template #footer>
-        <el-button @click="repairNodeDialogVisible = false">取消</el-button>
-        <el-button type="warning" @click="confirmRepairNode" :loading="repairNodeLoading">开始修复</el-button>
+        <button class="btn btn-secondary" @click="repairNodeDialogVisible = false">取消</button>
+        <button class="btn btn-primary" @click="confirmRepairNode" :disabled="repairNodeLoading">开始修复</button>
       </template>
     </el-dialog>
   </div>
 </template>
 
+
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Loading, House, Coin, Connection, Download, Back, Refresh, RefreshRight,
-  DataBoard, CircleCheck, Monitor, Document, Upload, WarnTriangleFilled
-} from '@element-plus/icons-vue'
-import {
-  getCluster, getInstallStatus, getClusterStatus, switchover, upgradeAgents, restartAgents, getAgentLogs, repairReplication, retryInstall,
+  getCluster, getInstallStatus, getClusterStatus, getEtcdStatus, switchover, upgradeAgents, restartAgents, restartMySQL, getAgentLogs, repairReplication, retryInstall,
   type Cluster, type ClusterStatus, type NodeStatus
 } from '@/api'
 
@@ -476,6 +632,10 @@ const repairNodeDialogVisible = ref(false)
 const repairNodeLoading = ref(false)
 const selectedRepairNode = ref<NodeStatus | null>(null)
 
+// MySQL 自动刷新
+const autoRefreshMySQL = ref(false)
+let mysqlRefreshTimer: number | null = null
+
 // 重试安装相关
 const retryDialogVisible = ref(false)
 const retryLoading = ref(false)
@@ -507,7 +667,6 @@ const isClusterHealthy = computed(() => clusterStatus.value?.leader?.is_healthy 
 
 const replicaNodes = computed(() => {
   if (!clusterStatus.value) return []
-  // 过滤掉 leader 节点（通过 node_id 匹配），其余都是从节点
   const leaderId = clusterStatus.value.leader?.node_id
   return clusterStatus.value.nodes.filter(node => node.node_id !== leaderId)
 })
@@ -515,6 +674,19 @@ const replicaNodes = computed(() => {
 const etcdNodes = computed(() => {
   if (!cluster.value) return []
   return cluster.value.hosts.filter(h => h.roles.includes('etcd'))
+})
+
+// etcd 健康状态
+const etcdHealthStatus = ref<Record<string, boolean>>({})
+
+const etcdNodesWithHealth = computed(() => {
+  if (!cluster.value) return []
+  return cluster.value.hosts
+    .filter(h => h.roles.includes('etcd'))
+    .map(h => ({
+      ...h,
+      is_healthy: etcdHealthStatus.value[h.ip] ?? false
+    }))
 })
 
 const agentNodes = computed(() => {
@@ -527,21 +699,17 @@ const agentHealthyCount = computed(() => {
   return clusterStatus.value.nodes.filter(n => n.is_healthy).length
 })
 
-// 检查是否有失败的节点
 const hasFailedNodes = computed(() => {
   if (!cluster.value) return false
   return cluster.value.hosts.some(h => h.status !== 'completed')
 })
 
-// 获取失败的节点列表
 const failedHosts = computed(() => {
   if (!cluster.value) return []
   return cluster.value.hosts.filter(h => h.status !== 'completed')
 })
 
 // 方法
-const handleMenuSelect = (index: string) => { activeMenu.value = index }
-
 const loadCluster = async () => {
   loading.value = true
   try {
@@ -569,8 +737,24 @@ const refreshMySQLStatus = async () => {
 const refreshEtcdStatus = async () => {
   refreshingEtcd.value = true
   await loadCluster()
+  await loadEtcdStatus()
   ElMessage.success('etcd 状态已刷新')
   refreshingEtcd.value = false
+}
+
+const loadEtcdStatus = async () => {
+  if (!cluster.value) return
+  try {
+    const { data } = await getEtcdStatus(cluster.value.id)
+    // 更新 etcd 健康状态
+    const healthMap: Record<string, boolean> = {}
+    for (const node of data.nodes) {
+      healthMap[node.ip] = node.is_healthy
+    }
+    etcdHealthStatus.value = healthMap
+  } catch (error) {
+    console.error('加载 etcd 状态失败:', error)
+  }
 }
 
 const refreshInstallStatus = async () => {
@@ -620,7 +804,34 @@ const performBatchUpgrade = async () => {
   if (!cluster.value || upgradeTargets.value.length === 0) return
   upgradeLoading.value = true
   try {
-    await upgradeAgents(cluster.value.id, upgradeTargets.value)
+    const { data } = await upgradeAgents(cluster.value.id, upgradeTargets.value, false)
+    
+    // 检查是否需要强制更新
+    if (data.status === 'no_update_needed') {
+      upgradeLoading.value = false
+      // 显示确认对话框
+      const confirmed = await ElMessageBox.confirm(
+        `所有节点版本已是最新 (${data.current_version})，是否强制更新？`,
+        '版本相同',
+        {
+          confirmButtonText: '强制更新',
+          cancelButtonText: '取消',
+          type: 'warning'
+        }
+      ).catch(() => false)
+      
+      if (confirmed) {
+        upgradeLoading.value = true
+        await upgradeAgents(cluster.value.id, upgradeTargets.value, true)
+        ElMessage.success('Agent 强制更新已开始')
+        upgradeDialogVisible.value = false
+        addLog('INFO', `开始强制更新 ${upgradeTargets.value.length} 个节点的 HA Agent`)
+        setTimeout(() => loadClusterStatus(), 5000)
+        upgradeLoading.value = false
+      }
+      return
+    }
+    
     ElMessage.success('Agent 更新已开始')
     upgradeDialogVisible.value = false
     addLog('INFO', `开始更新 ${upgradeTargets.value.length} 个节点的 HA Agent`)
@@ -645,7 +856,28 @@ const restartAgent = async (node: NodeStatus) => {
 const upgradeAgent = async (node: NodeStatus) => {
   if (!cluster.value) return
   try {
-    await upgradeAgents(cluster.value.id, [node.node_id])
+    const { data } = await upgradeAgents(cluster.value.id, [node.node_id], false)
+    
+    // 检查是否需要强制更新
+    if (data.status === 'no_update_needed') {
+      const confirmed = await ElMessageBox.confirm(
+        `节点 ${node.name} 版本已是最新 (${data.current_version})，是否强制更新？`,
+        '版本相同',
+        {
+          confirmButtonText: '强制更新',
+          cancelButtonText: '取消',
+          type: 'warning'
+        }
+      ).catch(() => false)
+      
+      if (confirmed) {
+        await upgradeAgents(cluster.value.id, [node.node_id], true)
+        ElMessage.success(`正在强制更新 ${node.name} 的 Agent`)
+        addLog('INFO', `强制更新 Agent: ${node.name}`)
+      }
+      return
+    }
+    
     ElMessage.success(`正在更新 ${node.name} 的 Agent`)
     addLog('INFO', `更新 Agent: ${node.name}`)
   } catch (error: any) {
@@ -654,27 +886,30 @@ const upgradeAgent = async (node: NodeStatus) => {
 }
 
 // 修复主从相关
-const showRepairDialog = () => {
-  repairDialogVisible.value = true
-}
+const showRepairDialog = () => { repairDialogVisible.value = true }
 
 const confirmRepair = async () => {
   if (!cluster.value) return
   repairLoading.value = true
   try {
-    await repairReplication(cluster.value.id)
-    ElMessage.success('主从修复已开始，请查看日志了解进度')
+    const { data } = await repairReplication(cluster.value.id)
     repairDialogVisible.value = false
-    addLog('INFO', '一键修复主从已发起')
-    // 延迟刷新状态
-    setTimeout(() => loadClusterStatus(), 5000)
+    
+    // 检查返回状态
+    if (data.status === 'healthy') {
+      ElMessage.success(`集群复制状态正常，无需修复。主节点: ${data.master} (${data.master_ip})`)
+      addLog('INFO', `集群状态检查完成，复制正常，主节点: ${data.master}`)
+    } else {
+      ElMessage.success('主从修复已开始，请查看日志了解进度')
+      addLog('INFO', '一键修复主从已发起')
+      setTimeout(() => loadClusterStatus(), 5000)
+    }
   } catch (error: any) {
     ElMessage.error(error.response?.data?.error || '修复失败')
   }
   repairLoading.value = false
 }
 
-// 单节点修复相关
 const showRepairNodeDialog = (node: NodeStatus) => {
   selectedRepairNode.value = node
   repairNodeDialogVisible.value = true
@@ -695,13 +930,25 @@ const confirmRepairNode = async () => {
     ElMessage.success(`节点 ${selectedRepairNode.value.name} 修复已开始，请稍候...`)
     repairNodeDialogVisible.value = false
     addLog('INFO', `开始修复节点: ${selectedRepairNode.value.name}`)
-    // 延迟刷新状态，给修复过程一些时间
     setTimeout(() => loadClusterStatus(), 10000)
     setTimeout(() => loadClusterStatus(), 20000)
   } catch (error: any) {
     ElMessage.error(error.message || '修复失败')
   }
   repairNodeLoading.value = false
+}
+
+// 重启单个节点的 MySQL
+const restartMySQLNode = async (node: NodeStatus) => {
+  if (!cluster.value) return
+  try {
+    await restartMySQL(cluster.value.id, [node.node_id])
+    ElMessage.success(`正在重启 ${node.name} 的 MySQL 服务`)
+    addLog('INFO', `重启 MySQL: ${node.name}`)
+    setTimeout(() => loadClusterStatus(), 5000)
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.error || '重启失败')
+  }
 }
 
 // 重试安装相关
@@ -783,7 +1030,19 @@ watch(autoRefreshLogs, (val) => {
   }
 })
 
-const getStatusType = (status?: string) => {
+watch(autoRefreshMySQL, (val) => {
+  if (val) {
+    mysqlRefreshTimer = window.setInterval(async () => {
+      await loadClusterStatus()
+    }, 5000)
+  } else if (mysqlRefreshTimer) {
+    clearInterval(mysqlRefreshTimer)
+    mysqlRefreshTimer = null
+  }
+})
+
+// 辅助方法
+const getStatusColor = (status?: string) => {
   if (status === 'completed') return 'success'
   if (status === 'pending') return 'warning'
   if (status?.startsWith('installing')) return 'primary'
@@ -791,14 +1050,14 @@ const getStatusType = (status?: string) => {
   return 'info'
 }
 
-const getRoleType = (role: string) => {
+const getRoleColor = (role: string) => {
   if (role === 'master') return 'warning'
   if (role === 'slave') return 'success'
   if (role === 'etcd') return 'info'
   return 'info'
 }
 
-const getPhaseType = (phase?: string) => {
+const getPhaseColor = (phase?: string) => {
   if (phase === 'completed') return 'success'
   if (phase?.startsWith('failed')) return 'danger'
   if (phase?.startsWith('phase')) return 'primary'
@@ -818,6 +1077,7 @@ const getPhaseText = (phase?: string) => {
 onMounted(async () => {
   await loadCluster()
   await loadClusterStatus()
+  await loadEtcdStatus()
   refreshTimer = window.setInterval(() => loadClusterStatus(), 15000)
   addLog('INFO', '集群详情页面已加载')
 })
@@ -825,49 +1085,260 @@ onMounted(async () => {
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
   if (logTimer) clearInterval(logTimer)
+  if (mysqlRefreshTimer) clearInterval(mysqlRefreshTimer)
 })
 </script>
 
+
 <style scoped lang="scss">
-.cluster-detail-layout { display: flex; min-height: calc(100vh - 100px); gap: 20px; }
-.sidebar { width: 220px; background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%); border-radius: 16px; padding: 20px 0; display: flex; flex-direction: column; }
-.sidebar-header { display: flex; align-items: center; gap: 10px; padding: 0 20px 20px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); color: #fff; font-size: 16px; font-weight: 600; }
-.sidebar-menu { background: transparent; border: none; flex: 1;
-  :deep(.el-menu-item) { color: rgba(255, 255, 255, 0.7); margin: 4px 10px; border-radius: 8px;
-    &:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
-    &.is-active { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: #fff; }
+.cluster-detail-page {
+  display: flex;
+  height: calc(100vh - 64px - 64px);
+  background: var(--bg-app);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+// 侧边栏
+.detail-sidebar {
+  width: 220px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.sidebar-header {
+  padding: 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid var(--border-color);
+  
+  .cluster-badge {
+    width: 44px;
+    height: 44px;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    box-shadow: 0 4px 12px rgba(6, 182, 212, 0.3);
+  }
+  
+  .cluster-title {
+    flex: 1;
+    min-width: 0;
+    
+    .name {
+      display: block;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .id {
+      display: block;
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: monospace;
+    }
   }
 }
-.sidebar-footer { padding: 20px; border-top: 1px solid rgba(255, 255, 255, 0.1);
-  .el-button { color: rgba(255, 255, 255, 0.7); width: 100%; justify-content: flex-start; &:hover { color: #fff; } }
+
+.sidebar-nav {
+  flex: 1;
+  padding: 16px 10px;
+  overflow-y: auto;
+  
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 14px;
+    margin: 3px 0;
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: var(--transition);
+    font-size: 14px;
+    
+    .nav-icon {
+      font-size: 16px;
+      width: 22px;
+      text-align: center;
+    }
+    
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+    
+    &.active {
+      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+      color: white;
+      box-shadow: 0 4px 12px rgba(6, 182, 212, 0.3);
+    }
+  }
 }
-.main-content { flex: 1; min-width: 0; }
-.content-card { border-radius: 16px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2); }
-.loading { text-align: center; padding: 60px; color: #909399; font-size: 16px; }
-.content-section { animation: fadeIn 0.3s ease; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.section-title { font-size: 22px; font-weight: 600; color: #303133; margin: 0 0 20px 0; }
-.stat-card { border-radius: 12px; display: flex; align-items: center; padding: 20px; gap: 16px; }
-.stat-icon { width: 60px; height: 60px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 28px; color: #fff;
-  &.mysql-icon { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-  &.etcd-icon { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
-  &.agent-icon { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
-  &.status-icon { background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); &.healthy { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); } }
+
+.sidebar-footer {
+  padding: 14px;
+  border-top: 1px solid var(--border-color);
+  
+  .back-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 10px 14px;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: var(--transition);
+    font-size: 14px;
+    
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+      border-color: var(--border-light);
+    }
+  }
 }
-.stat-info { .stat-value { font-size: 28px; font-weight: 700; color: #303133; } .stat-label { font-size: 14px; color: #909399; margin-top: 4px; } }
-.info-card, .control-card { border-radius: 12px; :deep(.el-card__header) { font-weight: 600; font-size: 16px; } }
-.card-header { display: flex; justify-content: space-between; align-items: center; }
-.node-detail { padding: 10px 0; }
-.log-card { :deep(.el-card__body) { padding: 0; } }
-.log-container { height: 500px; overflow-y: auto; background: #1e1e1e; border-radius: 0 0 12px 12px; padding: 15px; font-family: 'Monaco', 'Menlo', monospace; font-size: 13px; }
-.log-line { padding: 4px 0; border-bottom: 1px solid #333; display: flex; gap: 10px; color: #d4d4d4; }
-.log-time { color: #6a9955; min-width: 70px; }
-.log-level { min-width: 50px; font-weight: bold; }
-.log-node { color: #569cd6; }
-.log-message { flex: 1; word-break: break-all; }
-.log-error { color: #f14c4c; .log-level { color: #f14c4c; } }
-.log-warn { color: #cca700; .log-level { color: #cca700; } }
-.log-info { .log-level { color: #3794ff; } }
-.log-empty { color: #666; text-align: center; padding: 50px; }
+
+// 主内容区
+.detail-content {
+  flex: 1;
+  padding: 28px;
+  overflow-y: auto;
+}
+
+.content-section {
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+// 日志样式
+.log-card .card-body {
+  padding: 0 !important;
+}
+
+.log-container {
+  height: 450px;
+  overflow-y: auto;
+  background: #0d0d12;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  padding: 16px;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.log-line {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  display: flex;
+  gap: 12px;
+  color: #b0b0c0;
+  
+  .log-time {
+    color: var(--success-text);
+    min-width: 70px;
+  }
+  
+  .log-level {
+    min-width: 50px;
+    font-weight: 600;
+  }
+  
+  .log-node {
+    color: var(--primary);
+  }
+  
+  .log-message {
+    flex: 1;
+    word-break: break-all;
+  }
+  
+  &.log-error {
+    color: var(--danger-text);
+    .log-level { color: var(--danger-text); }
+  }
+  
+  &.log-warn {
+    color: var(--warning-text);
+    .log-level { color: var(--warning-text); }
+  }
+  
+  &.log-info {
+    .log-level { color: var(--info-text); }
+  }
+}
+
+.log-empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 60px;
+}
+
+// 表单选择框
+.form-select {
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 14px;
+  cursor: pointer;
+  
+  &:focus {
+    outline: none;
+    border-color: var(--primary);
+  }
+  
+  option {
+    background: var(--bg-card);
+    color: var(--text-primary);
+  }
+}
+
+// Element Plus 对话框覆盖
+:deep(.el-dialog) {
+  background: var(--bg-card) !important;
+  border-radius: var(--radius-lg) !important;
+  border: 1px solid var(--border-color) !important;
+  
+  .el-dialog__header {
+    border-bottom: 1px solid var(--border-color);
+    padding: 20px 24px;
+  }
+  
+  .el-dialog__title {
+    color: var(--text-primary) !important;
+    font-size: 18px;
+    font-weight: 600;
+  }
+  
+  .el-dialog__body {
+    padding: 24px;
+  }
+  
+  .el-dialog__footer {
+    border-top: 1px solid var(--border-color);
+    padding: 16px 24px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+}
 </style>

@@ -105,10 +105,12 @@ func (s *Server) setupRoutes() {
 
 	// Cluster operations
 	api.HandleFunc("/clusters/{id}/status", s.handleClusterStatus).Methods("GET", "OPTIONS")
+	api.HandleFunc("/clusters/{id}/etcd-status", s.handleEtcdStatus).Methods("GET", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/switchover", s.handleSwitchover).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/init-mysql-accounts", s.handleInitMySQLAccounts).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/upgrade-agents", s.handleUpgradeAgents).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/restart-agents", s.handleRestartAgents).Methods("POST", "OPTIONS")
+	api.HandleFunc("/clusters/{id}/restart-mysql", s.handleRestartMySQL).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/logs", s.handleGetLogs).Methods("GET", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/repair-replication", s.handleRepairReplication).Methods("POST", "OPTIONS")
 	api.HandleFunc("/clusters/{id}/nodes/{nodeId}/repair", s.handleRepairNode).Methods("POST", "OPTIONS")
@@ -118,13 +120,22 @@ func (s *Server) setupRoutes() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}).Methods("GET")
 
+	// Version endpoint - return all version info
+	s.router.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"backend_version": "1.0.0",
+			"agent_version":   s.GetAgentVersion(),
+		})
+	}).Methods("GET")
+
 	// Root endpoint - return API info instead of serving frontend
 	s.router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"service": "MySQL HA Web Admin API",
-			"version": "1.0.0",
-			"api":     "/api/v1",
-			"health":  "/health",
+			"service":         "MySQL HA Web Admin API",
+			"backend_version": "1.0.0",
+			"agent_version":   s.GetAgentVersion(),
+			"api":             "/api/v1",
+			"health":          "/health",
 		})
 	}).Methods("GET")
 }
@@ -1223,6 +1234,61 @@ func (s *Server) handleInitMySQLAccounts(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// handleEtcdStatus returns the health status of etcd nodes
+func (s *Server) handleEtcdStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	s.mu.RLock()
+	cluster, ok := s.clusters[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		writeError(w, http.StatusNotFound, "cluster not found")
+		return
+	}
+
+	type EtcdNodeStatus struct {
+		IP        string `json:"ip"`
+		Name      string `json:"name"`
+		IsHealthy bool   `json:"is_healthy"`
+		IsLeader  bool   `json:"is_leader"`
+	}
+
+	var etcdStatus []EtcdNodeStatus
+
+	// 检查每个 etcd 节点的健康状态
+	for _, host := range cluster.Hosts {
+		if !host.IsEtcdNode() {
+			continue
+		}
+
+		status := EtcdNodeStatus{
+			IP:        host.IP,
+			Name:      host.Name,
+			IsHealthy: false,
+			IsLeader:  false,
+		}
+
+		// 通过 HTTP 检查 etcd 健康状态
+		client := &http.Client{Timeout: 3 * time.Second}
+		healthURL := fmt.Sprintf("http://%s:2379/health", host.IP)
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				status.IsHealthy = true
+			}
+		}
+
+		etcdStatus = append(etcdStatus, status)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"nodes": etcdStatus,
+	})
+}
+
 func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
@@ -1557,6 +1623,7 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		NodeIDs []string `json:"node_ids"`
+		Force   bool     `json:"force"` // 强制更新，即使版本相同
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1573,6 +1640,69 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 	// 检查并更新 Agent 版本号（如果二进制文件有变化）
 	s.checkAndUpdateAgentVersion()
 	currentVersion := s.GetAgentVersion()
+	log.Printf("[DEBUG] 当前 Agent 版本: %s, Force: %v", currentVersion, req.Force)
+
+	// 检查是否需要更新（比较版本号）
+	// 获取节点当前的版本号
+	agentPort := 8080
+	if cluster.Settings != nil && cluster.Settings.HAAgentPort > 0 {
+		agentPort = cluster.Settings.HAAgentPort
+	}
+
+	needsUpdate := false
+	var nodesNeedingUpdate []string
+
+	for _, nodeID := range req.NodeIDs {
+		var targetHost *installer.Host
+		for i := range cluster.Hosts {
+			if cluster.Hosts[i].ID == nodeID {
+				targetHost = &cluster.Hosts[i]
+				break
+			}
+		}
+		if targetHost == nil {
+			continue
+		}
+
+		// 获取节点当前版本
+		nodeVersion := ""
+		client := &http.Client{Timeout: 5 * time.Second}
+		stateURL := fmt.Sprintf("http://%s:%d/state", targetHost.IP, agentPort)
+		log.Printf("[DEBUG] 获取节点版本: %s", stateURL)
+		resp, err := client.Get(stateURL)
+		if err != nil {
+			log.Printf("[DEBUG] 获取节点 %s 版本失败: %v", targetHost.Name, err)
+		} else {
+			var state map[string]interface{}
+			if json.NewDecoder(resp.Body).Decode(&state) == nil {
+				// 字段名是 agent_version，不是 version
+				if v, ok := state["agent_version"].(string); ok {
+					nodeVersion = v
+				}
+			}
+			resp.Body.Close()
+		}
+
+		log.Printf("[DEBUG] 节点 %s 版本: %s, 当前版本: %s, 需要更新: %v", targetHost.Name, nodeVersion, currentVersion, nodeVersion != currentVersion)
+
+		if nodeVersion != currentVersion {
+			needsUpdate = true
+			nodesNeedingUpdate = append(nodesNeedingUpdate, targetHost.Name)
+		}
+	}
+
+	log.Printf("[DEBUG] 需要更新: %v, Force: %v", needsUpdate, req.Force)
+
+	// 如果版本相同且不是强制更新，返回提示
+	if !needsUpdate && !req.Force {
+		log.Printf("[INFO] 所有节点版本已是最新 (%s)，无需更新", currentVersion)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":          "no_update_needed",
+			"message":         "所有节点版本已是最新",
+			"current_version": currentVersion,
+		})
+		return
+	}
 
 	// 更新集群的 Agent 版本号
 	s.mu.Lock()
@@ -1584,7 +1714,7 @@ func (s *Server) handleUpgradeAgents(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[ERROR] Failed to save cluster config: %v", err)
 	}
 
-	log.Printf("[INFO] Agent version for upgrade: %s", currentVersion)
+	log.Printf("[INFO] Agent version for upgrade: %s (force: %v)", currentVersion, req.Force)
 
 	// 在后台执行智能滚动更新
 	go func() {
@@ -1808,6 +1938,120 @@ func (s *Server) handleRepairReplication(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "cluster not found")
 		return
 	}
+
+	// 先检查集群状态是否正常
+	log.Printf("[INFO] 检查集群 %s 的复制状态...", cluster.Name)
+
+	type NodeCheckResult struct {
+		Host       *installer.Host
+		IsReadOnly bool
+		HasRepl    bool
+		MasterHost string
+		IORunning  bool
+		SQLRunning bool
+		Error      string
+	}
+
+	var checkResults []NodeCheckResult
+	var detectedMaster *installer.Host
+	allReplicasHealthy := true
+	hasIssues := false
+
+	for i := range cluster.Hosts {
+		host := &cluster.Hosts[i]
+		if !host.IsMySQLNode() {
+			continue
+		}
+
+		result := NodeCheckResult{Host: host}
+
+		client, err := installer.NewSSHClient(host)
+		if err != nil {
+			result.Error = fmt.Sprintf("SSH连接失败: %v", err)
+			checkResults = append(checkResults, result)
+			hasIssues = true
+			continue
+		}
+
+		mysqlCmd := fmt.Sprintf("%s/mysql/bin/mysql -u root -p'%s' --socket=/tmp/mysql.sock",
+			cluster.InstallPath, cluster.Settings.RootPassword)
+
+		// 检查 read_only 状态
+		output, err := client.Run(fmt.Sprintf("%s -N -e \"SELECT @@read_only\"", mysqlCmd))
+		if err != nil {
+			result.Error = fmt.Sprintf("无法查询read_only: %v", err)
+			client.Close()
+			checkResults = append(checkResults, result)
+			hasIssues = true
+			continue
+		}
+		result.IsReadOnly = strings.TrimSpace(output) == "1"
+
+		// 检查复制状态
+		output, err = client.Run(fmt.Sprintf("%s -e \"SHOW SLAVE STATUS\\G\"", mysqlCmd))
+		if err == nil && strings.Contains(output, "Master_Host") {
+			result.HasRepl = true
+			for _, line := range strings.Split(output, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "Master_Host:") {
+					result.MasterHost = strings.TrimSpace(strings.TrimPrefix(line, "Master_Host:"))
+				}
+				if strings.HasPrefix(line, "Slave_IO_Running:") {
+					result.IORunning = strings.Contains(line, "Yes")
+				}
+				if strings.HasPrefix(line, "Slave_SQL_Running:") {
+					result.SQLRunning = strings.Contains(line, "Yes")
+				}
+			}
+			// 检查从节点复制是否正常
+			if !result.IORunning || !result.SQLRunning {
+				allReplicasHealthy = false
+				hasIssues = true
+			}
+		}
+
+		client.Close()
+		checkResults = append(checkResults, result)
+
+		// 判断主节点
+		if !result.IsReadOnly && !result.HasRepl {
+			if detectedMaster == nil {
+				detectedMaster = host
+			} else {
+				// 多个主节点，有问题
+				hasIssues = true
+			}
+		}
+	}
+
+	// 检查是否有主节点
+	if detectedMaster == nil {
+		hasIssues = true
+	}
+
+	// 检查所有从节点是否都指向同一个主节点
+	if detectedMaster != nil {
+		for _, result := range checkResults {
+			if result.HasRepl && result.MasterHost != "" && result.MasterHost != detectedMaster.IP {
+				hasIssues = true
+				break
+			}
+		}
+	}
+
+	// 如果集群状态正常，返回无需修复
+	if !hasIssues && detectedMaster != nil && allReplicasHealthy {
+		log.Printf("[INFO] 集群 %s 复制状态正常，无需修复", cluster.Name)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":    "healthy",
+			"message":   "集群复制状态正常，无需修复",
+			"master":    detectedMaster.Name,
+			"master_ip": detectedMaster.IP,
+		})
+		return
+	}
+
+	log.Printf("[INFO] 集群 %s 检测到问题，开始修复...", cluster.Name)
 
 	// 在后台执行修复
 	go func() {
@@ -2489,5 +2733,100 @@ func (s *Server) handleRepairNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"status":  "started",
 		"message": fmt.Sprintf("节点 %s 修复已开始", targetHost.Name),
+	})
+}
+
+// handleRestartMySQL handles MySQL service restart requests
+// 通过 HA Agent API 重启指定节点的 MySQL 服务
+func (s *Server) handleRestartMySQL(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	s.mu.RLock()
+	cluster, ok := s.clusters[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		writeError(w, http.StatusNotFound, "cluster not found")
+		return
+	}
+
+	var req struct {
+		NodeIDs []string `json:"node_ids"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if len(req.NodeIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "node_ids is required")
+		return
+	}
+
+	// 获取 Agent 端口
+	agentPort := 8080
+	if cluster.Settings != nil && cluster.Settings.HAAgentPort > 0 {
+		agentPort = cluster.Settings.HAAgentPort
+	}
+
+	// 在后台执行重启
+	go func() {
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] 开始通过 HA Agent 重启 MySQL 服务")
+		log.Printf("[INFO] ========================================")
+
+		for _, nodeID := range req.NodeIDs {
+			var targetHost *installer.Host
+			for i := range cluster.Hosts {
+				if cluster.Hosts[i].ID == nodeID && cluster.Hosts[i].IsMySQLNode() {
+					targetHost = &cluster.Hosts[i]
+					break
+				}
+			}
+			if targetHost == nil {
+				log.Printf("[WARN] MySQL Node %s not found", nodeID)
+				continue
+			}
+
+			log.Printf("[INFO] 通过 Agent 重启 MySQL: %s (%s)", targetHost.Name, targetHost.IP)
+
+			// 调用 HA Agent 的 restart-mysql API
+			agentURL := fmt.Sprintf("http://%s:%d/api/v1/restart-mysql", targetHost.IP, agentPort)
+			client := &http.Client{Timeout: 30 * time.Second}
+
+			req, err := http.NewRequest("POST", agentURL, strings.NewReader("{}"))
+			if err != nil {
+				log.Printf("[ERROR] [%s] 创建请求失败: %v", targetHost.Name, err)
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("[ERROR] [%s] Agent API 调用失败: %v", targetHost.Name, err)
+				continue
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				log.Printf("[INFO] [%s] MySQL 重启请求已发送", targetHost.Name)
+			} else {
+				log.Printf("[ERROR] [%s] MySQL 重启请求失败，状态码: %d", targetHost.Name, resp.StatusCode)
+			}
+
+			// 等待一下再处理下一个节点
+			time.Sleep(2 * time.Second)
+		}
+
+		log.Printf("[INFO] ========================================")
+		log.Printf("[INFO] MySQL 重启请求已全部发送")
+		log.Printf("[INFO] ========================================")
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":  "started",
+		"message": fmt.Sprintf("Restarting MySQL on %d nodes via HA Agent", len(req.NodeIDs)),
 	})
 }

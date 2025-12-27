@@ -1442,6 +1442,28 @@ func (a *Agent) RequestDemote(reason string) error {
 	return nil
 }
 
+// RestartMySQL restarts the MySQL service on this node
+// This is called via the API when a manual restart is requested
+func (a *Agent) RestartMySQL() error {
+	a.logger.Info("MySQL restart requested via API")
+
+	// 先尝试 mysqld 服务
+	cmd := exec.Command("sudo", "systemctl", "restart", "mysqld")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		a.logger.Warn(fmt.Sprintf("failed to restart mysqld: %v, output: %s", err, string(output)))
+
+		// 如果 mysqld 服务不存在，尝试 mysql 服务
+		cmd = exec.Command("sudo", "systemctl", "restart", "mysql")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			a.logger.Error(fmt.Sprintf("failed to restart mysql: %v, output: %s", err, string(output)))
+			return fmt.Errorf("failed to restart MySQL service: %w", err)
+		}
+	}
+
+	a.logger.Info("MySQL restart command executed successfully")
+	return nil
+}
+
 // repairMySQLEnvironment checks and repairs MySQL runtime environment
 // This handles issues like missing directories after system reboot
 func (a *Agent) repairMySQLEnvironment() error {

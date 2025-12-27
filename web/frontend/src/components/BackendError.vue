@@ -1,24 +1,47 @@
 <template>
   <div class="backend-error">
     <div class="error-container">
-      <div class="error-icon">
-        <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10"></circle>
-          <line x1="12" y1="8" x2="12" y2="12"></line>
-          <line x1="12" y1="16" x2="12.01" y2="16"></line>
-        </svg>
+      <div class="error-visual">
+        <div class="error-icon-wrapper">
+          <svg class="error-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 9v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="pulse-ring"></div>
+        <div class="pulse-ring delay"></div>
       </div>
-      <h1>服务不可用</h1>
+      
+      <h1 class="error-title">服务连接失败</h1>
       <p class="error-message">{{ message || '无法连接到后端服务' }}</p>
-      <p class="error-hint">请检查后端服务是否正常运行在 <code>localhost:8888</code></p>
-      <div class="actions">
-        <button @click="retry" :disabled="checking" class="retry-btn">
-          <span v-if="checking">检查中...</span>
-          <span v-else>重试连接</span>
-        </button>
+      
+      <div class="error-details">
+        <div class="detail-item">
+          <span class="detail-icon">🔗</span>
+          <span class="detail-text">API 地址: <code>localhost:8888</code></span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-icon">📡</span>
+          <span class="detail-text">请确保后端服务正在运行</span>
+        </div>
+        <div class="detail-item">
+          <span class="detail-icon">💡</span>
+          <span class="detail-text">运行命令: <code>./webadmin</code></span>
+        </div>
       </div>
-      <div v-if="retryCount > 0" class="retry-info">
-        已重试 {{ retryCount }} 次
+      
+      <button 
+        class="retry-button" 
+        @click="retry" 
+        :disabled="checking"
+        :class="{ loading: checking }"
+      >
+        <span v-if="checking" class="button-spinner"></span>
+        <span v-else class="button-icon">🔄</span>
+        <span>{{ checking ? '检查中...' : '重试连接' }}</span>
+      </button>
+      
+      <div v-if="retryCount > 0" class="retry-count">
+        已尝试 {{ retryCount }} 次
       </div>
     </div>
   </div>
@@ -53,80 +76,176 @@ const retry = async () => {
 }
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .backend-error {
   display: flex;
   justify-content: center;
   align-items: center;
   min-height: 100vh;
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-  color: #fff;
+  background: var(--bg-app);
+  padding: 20px;
 }
 
 .error-container {
   text-align: center;
-  padding: 40px;
-  max-width: 500px;
+  max-width: 440px;
+}
+
+.error-visual {
+  position: relative;
+  width: 110px;
+  height: 110px;
+  margin: 0 auto 32px;
+}
+
+.error-icon-wrapper {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--danger-bg);
+  border-radius: 50%;
+  z-index: 1;
+  border: 2px solid rgba(239, 68, 68, 0.3);
 }
 
 .error-icon {
-  color: #ff6b6b;
-  margin-bottom: 20px;
+  width: 44px;
+  height: 44px;
+  color: var(--danger);
 }
 
-h1 {
-  font-size: 2rem;
-  margin-bottom: 16px;
-  color: #fff;
+.pulse-ring {
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--danger);
+  border-radius: 50%;
+  opacity: 0;
+  animation: pulse 2s ease-out infinite;
+  
+  &.delay {
+    animation-delay: 1s;
+  }
 }
 
-.error-message {
-  font-size: 1.1rem;
-  color: #ccc;
+@keyframes pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+  100% {
+    transform: scale(1.5);
+    opacity: 0;
+  }
+}
+
+.error-title {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--text-primary);
   margin-bottom: 12px;
 }
 
-.error-hint {
-  font-size: 0.9rem;
-  color: #888;
-  margin-bottom: 24px;
+.error-message {
+  font-size: 15px;
+  color: var(--text-secondary);
+  margin-bottom: 32px;
 }
 
-.error-hint code {
-  background: rgba(255, 255, 255, 0.1);
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-family: monospace;
+.error-details {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin-bottom: 32px;
+  text-align: left;
 }
 
-.actions {
-  margin-top: 24px;
+.detail-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+  
+  &:not(:last-child) {
+    border-bottom: 1px solid var(--border-color);
+  }
+  
+  .detail-icon {
+    font-size: 20px;
+    width: 28px;
+    text-align: center;
+  }
+  
+  .detail-text {
+    font-size: 14px;
+    color: var(--text-secondary);
+    
+    code {
+      background: var(--bg-app);
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-family: 'SF Mono', Monaco, monospace;
+      color: var(--primary);
+      font-size: 13px;
+    }
+  }
 }
 
-.retry-btn {
-  background: #4a90d9;
-  color: #fff;
+.retry-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 32px;
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+  color: white;
   border: none;
-  padding: 12px 32px;
-  font-size: 1rem;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
+  font-size: 15px;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
+  min-width: 180px;
+  
+  &:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-glow);
+  }
+  
+  &:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+  }
+  
+  &.loading {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+  }
+  
+  .button-icon {
+    font-size: 18px;
+  }
 }
 
-.retry-btn:hover:not(:disabled) {
-  background: #5a9fe9;
-  transform: translateY(-2px);
+.button-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
 }
 
-.retry-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
-.retry-info {
+.retry-count {
   margin-top: 16px;
-  font-size: 0.85rem;
-  color: #666;
+  font-size: 13px;
+  color: var(--text-muted);
 }
 </style>

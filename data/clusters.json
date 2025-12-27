@@ -57,6 +57,6 @@
       "ha_agent_port": 8080
     },
     "phase": "completed",
-    "agent_version": "1.0.8"
+    "agent_version": "1.0.9"
   }
 }
